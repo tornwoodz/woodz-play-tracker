@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from datetime import datetime, timezone
 from typing import Optional
@@ -9,6 +10,25 @@ from discord import app_commands
 
 DATA_FILE = "picktrax_data.json"
 
+# ===== CHANNEL / ROLE CONFIG =====
+TRACKED_PICK_CHANNELS = {
+    "hammers-aka-singles🔨🔨": "hammer",
+    "parlays-🍀": "parlay",
+    "weekly-locks📄": "weekly",
+    "🚨live-bets🚨": "live",
+}
+
+WIN_SUBMISSION_CHANNELS = {
+    "general-chat💬",
+    "vip-general-chatroom💬",
+}
+
+POST_YOUR_WINS_CHANNEL = "post-your-wins"
+DAILY_RECAP_CHANNEL = "daily-recap📄"
+
+VIP_ROLE_NAME = "🏆VIP"
+PUB_ROLE_NAME = "🆓PUB"
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -17,18 +37,18 @@ def utc_now_iso() -> str:
 def default_data() -> dict:
     return {
         "owner_id": None,
-        "recap_channel_id": None,
-        "unit_value": 100.0,
-        "show_dollars": False,
         "record": {
             "wins": 0,
             "losses": 0,
             "pushes": 0,
             "units": 0.0,
         },
+        "show_dollars": False,
+        "unit_value": 100.0,
         "picks": [],
         "graded_history": [],
         "message_pick_map": {},
+        "registered_source_messages": [],
     }
 
 
@@ -61,6 +81,25 @@ def load_data() -> dict:
 data = load_data()
 
 
+def is_owner_user(user_id: int) -> bool:
+    owner_id = data.get("owner_id")
+    return owner_id is not None and user_id == owner_id
+
+
+def get_best_member_role(member: discord.Member) -> str:
+    role_names = {role.name for role in member.roles}
+    if VIP_ROLE_NAME in role_names:
+        return VIP_ROLE_NAME
+    if PUB_ROLE_NAME in role_names:
+        return PUB_ROLE_NAME
+    return "Member"
+
+
+def has_member_submission_role(member: discord.Member) -> bool:
+    role_names = {role.name for role in member.roles}
+    return VIP_ROLE_NAME in role_names or PUB_ROLE_NAME in role_names
+
+
 def format_profit(units: float) -> str:
     if data["show_dollars"]:
         dollars = units * float(data["unit_value"])
@@ -70,13 +109,70 @@ def format_profit(units: float) -> str:
     return f"{sign}{units:.2f}U"
 
 
-def is_owner_user(user_id: int) -> bool:
-    owner_id = data.get("owner_id")
-    return owner_id is not None and user_id == owner_id
+def extract_units_from_text(text: str) -> float:
+    if not text:
+        return 1.0
+
+    patterns = [
+        r"([+-]?\d+(?:\.\d+)?)\s*u\b",
+        r"([+-]?\d+(?:\.\d+)?)\s*unit\b",
+        r"([+-]?\d+(?:\.\d+)?)\s*units\b",
+    ]
+
+    lowered = text.lower()
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            try:
+                return abs(float(match.group(1)))
+            except Exception:
+                pass
+
+    return 1.0
+
+
+def detect_result(text: str) -> Optional[str]:
+    exact = text.strip().lower()
+
+    if exact in {"win", "w", "cash", "cashed", "hit"}:
+        return "win"
+    if exact in {"loss", "l", "lost", "miss", "missed"}:
+        return "loss"
+    if exact in {"push", "p"}:
+        return "push"
+
+    if (
+        "as a win" in exact
+        or "grade win" in exact
+        or "mark win" in exact
+        or "this hit" in exact
+        or "cash it" in exact
+        or "winner" in exact
+        or "i won" in exact
+    ):
+        return "win"
+
+    if (
+        "as a loss" in exact
+        or "grade loss" in exact
+        or "mark loss" in exact
+        or "it lost" in exact
+        or "missed" in exact
+    ):
+        return "loss"
+
+    if "as a push" in exact or "grade push" in exact or "mark push" in exact:
+        return "push"
+
+    return None
 
 
 def pending_picks() -> list:
     return [p for p in data["picks"] if p["status"] == "pending"]
+
+
+def graded_history() -> list:
+    return data["graded_history"]
 
 
 def find_pick_by_id(pick_id: int) -> Optional[dict]:
@@ -86,14 +182,8 @@ def find_pick_by_id(pick_id: int) -> Optional[dict]:
     return None
 
 
-def graded_history() -> list:
-    return data["graded_history"]
-
-
 def build_pick_embed(pick: dict) -> discord.Embed:
-    status = pick["status"].upper()
     color = discord.Color.blurple()
-
     if pick["status"] == "win":
         color = discord.Color.green()
     elif pick["status"] == "loss":
@@ -102,21 +192,25 @@ def build_pick_embed(pick: dict) -> discord.Embed:
         color = discord.Color.light_grey()
 
     embed = discord.Embed(
-        title=f"Official Pick #{pick['id']}",
+        title=f"Pick #{pick['id']} • {pick['play_type'].title()}",
         description=pick["bet"],
         color=color,
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Units", value=f"{pick['units']:.2f}U", inline=True)
     embed.add_field(name="Odds", value=f"{pick['odds']:+d}", inline=True)
-    embed.add_field(name="Status", value=status, inline=True)
+    embed.add_field(name="Status", value=pick["status"].upper(), inline=True)
 
-    if pick.get("status") != "pending":
+    if pick["status"] != "pending":
         embed.add_field(
             name="Profit",
             value=format_profit(float(pick.get("profit_units", 0.0))),
             inline=False,
         )
+
+    source_channel = pick.get("source_channel_name")
+    if source_channel:
+        embed.add_field(name="Source Channel", value=source_channel, inline=False)
 
     return embed
 
@@ -139,12 +233,8 @@ def build_record_embed() -> discord.Embed:
 
 
 async def post_recap_if_configured(guild: discord.Guild) -> None:
-    channel_id = data.get("recap_channel_id")
-    if not channel_id:
-        return
-
-    channel = guild.get_channel(channel_id)
-    if channel is None:
+    recap_channel = discord.utils.get(guild.text_channels, name=DAILY_RECAP_CHANNEL)
+    if not recap_channel:
         return
 
     rec = data["record"]
@@ -162,7 +252,7 @@ async def post_recap_if_configured(guild: discord.Guild) -> None:
     embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
 
     try:
-        await channel.send(embed=embed)
+        await recap_channel.send(embed=embed)
     except Exception as e:
         print(f"Failed to post recap: {e}")
 
@@ -177,13 +267,9 @@ async def disable_pick_buttons_for_message(
 
     try:
         message = await channel.fetch_message(message_id)
-    except Exception:
-        return
-
-    try:
         await message.edit(embed=build_pick_embed(pick), view=None)
     except Exception as e:
-        print(f"Failed to edit graded pick message: {e}")
+        print(f"Failed to disable buttons: {e}")
 
 
 def apply_grade_to_pick(pick: dict, result: str, grader_id: int) -> tuple[bool, str]:
@@ -220,9 +306,38 @@ def apply_grade_to_pick(pick: dict, result: str, grader_id: int) -> tuple[bool, 
 
     return True, (
         f"✅ Pick #{pick['id']} graded as **{result.upper()}**\n"
-        f"Bet: {pick['bet']}\n"
+        f"Type: {pick['play_type'].title()}\n"
+        f"Units: {pick['units']:.2f}U\n"
         f"Profit: {format_profit(pick['profit_units'])}"
     )
+
+
+def create_auto_pick_from_message(message: discord.Message, play_type: str) -> dict:
+    next_id = len(data["picks"]) + len(data["graded_history"]) + 1
+    units = extract_units_from_text(message.content)
+
+    pick = {
+        "id": next_id,
+        "bet": message.content[:500] if message.content else f"Graphic pick from message {message.id}",
+        "units": units,
+        "odds": -110,
+        "status": "pending",
+        "created_by": message.author.id,
+        "created_at": utc_now_iso(),
+        "graded_at": None,
+        "graded_by": None,
+        "result": None,
+        "profit_units": 0.0,
+        "play_type": play_type,
+        "source_message_id": message.id,
+        "source_channel_name": message.channel.name,
+    }
+
+    data["picks"].append(pick)
+    data["message_pick_map"][str(message.id)] = pick["id"]
+    data["registered_source_messages"].append(message.id)
+    save_data(data)
+    return pick
 
 
 class GradeView(discord.ui.View):
@@ -273,6 +388,7 @@ class GradeView(discord.ui.View):
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -289,12 +405,8 @@ async def on_ready():
 
 
 @bot.tree.error
-async def on_app_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
-):
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     print(f"❌ Slash command error: {error}")
-
     try:
         if interaction.response.is_done():
             await interaction.followup.send(f"Error: {error}", ephemeral=True)
@@ -309,35 +421,28 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    content = message.content.lower().strip()
+    content = (message.content or "").lower().strip()
     bot_mentioned = bot.user in message.mentions if bot.user else False
 
-    def detect_result(text: str) -> Optional[str]:
-        exact = text.strip()
+    # ===== AUTO REGISTER YOUR PICKS FROM PICK CHANNELS =====
+    if message.author.id == data.get("owner_id"):
+        channel_name = message.channel.name
+        has_graphic = len(message.attachments) > 0 or len(message.embeds) > 0
 
-        if exact in {"win", "w", "cash", "cashed", "hit"}:
-            return "win"
-        if exact in {"loss", "l", "lost", "miss", "missed"}:
-            return "loss"
-        if exact in {"push", "p"}:
-            return "push"
+        if channel_name in TRACKED_PICK_CHANNELS and has_graphic:
+            if message.id not in data.get("registered_source_messages", []):
+                play_type = TRACKED_PICK_CHANNELS[channel_name]
+                create_auto_pick_from_message(message, play_type)
 
-        if "as a win" in text or "grade win" in text or "mark win" in text or "this hit" in text or "cash it" in text:
-            return "win"
-        if "as a loss" in text or "grade loss" in text or "mark loss" in text or "it lost" in text or "missed" in text:
-            return "loss"
-        if "as a push" in text or "grade push" in text or "mark push" in text:
-            return "push"
+                try:
+                    await message.add_reaction("📌")
+                except Exception:
+                    pass
 
-        return None
-
+    # ===== OWNER REPLY-TO-GRADE YOUR PICK POSTS =====
     result = detect_result(content)
 
-    if message.reference and result in {"win", "loss", "push"}:
-        if data.get("owner_id") and not is_owner_user(message.author.id):
-            await bot.process_commands(message)
-            return
-
+    if message.reference and bot_mentioned and message.author.id == data.get("owner_id"):
         try:
             referenced = await message.channel.fetch_message(message.reference.message_id)
         except Exception:
@@ -347,14 +452,10 @@ async def on_message(message: discord.Message):
         pick_id = data["message_pick_map"].get(str(referenced.id))
         if pick_id:
             pick = find_pick_by_id(int(pick_id))
-            if pick:
+
+            if pick and result in {"win", "loss", "push"}:
                 ok, msg = apply_grade_to_pick(pick, result, message.author.id)
                 if ok:
-                    await disable_pick_buttons_for_message(
-                        message.channel,
-                        int(referenced.id),
-                        pick,
-                    )
                     await message.channel.send(msg)
                     if message.guild:
                         await post_recap_if_configured(message.guild)
@@ -364,81 +465,51 @@ async def on_message(message: discord.Message):
                 await bot.process_commands(message)
                 return
 
-    if message.reference and bot_mentioned:
-        if data.get("owner_id") and not is_owner_user(message.author.id):
-            await bot.process_commands(message)
-            return
+            if pick and "grade this" in content:
+                await message.channel.send(
+                    f"Pick #{pick['id']} ready to grade:",
+                    embed=build_pick_embed(pick),
+                    view=GradeView(pick["id"]),
+                )
+                await bot.process_commands(message)
+                return
 
-        try:
-            referenced = await message.channel.fetch_message(message.reference.message_id)
-        except Exception:
-            await message.channel.send("Could not find the message you replied to.")
-            await bot.process_commands(message)
-            return
+    # ===== MEMBER WIN SUBMISSIONS TO POST-YOUR-WINS =====
+    if (
+        message.channel.name in WIN_SUBMISSION_CHANNELS
+        and bot_mentioned
+        and isinstance(message.author, discord.Member)
+        and has_member_submission_role(message.author)
+    ):
+        win_result = detect_result(content)
+        if win_result == "win":
+            wins_channel = discord.utils.get(message.guild.text_channels, name=POST_YOUR_WINS_CHANNEL)
+            if wins_channel:
+                role_name = get_best_member_role(message.author)
 
-        has_graphic = len(referenced.attachments) > 0 or len(referenced.embeds) > 0
+                embed = discord.Embed(
+                    title="🏆 New Winner Submitted",
+                    description=message.content,
+                    color=discord.Color.green() if role_name == VIP_ROLE_NAME else discord.Color.blue(),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                embed.add_field(name="User", value=message.author.mention, inline=True)
+                embed.add_field(name="Role", value=role_name, inline=True)
+                embed.add_field(name="Source", value=f"#{message.channel.name}", inline=True)
 
-        if not has_graphic:
-            await bot.process_commands(message)
-            return
+                files = []
+                for attachment in message.attachments:
+                    try:
+                        file = await attachment.to_file()
+                        files.append(file)
+                    except Exception:
+                        pass
 
-        if "grade this" in content and result is None:
-            temp_pick = {
-                "id": len(data["picks"]) + len(data["graded_history"]) + 1,
-                "bet": f"Manual graphic reply from message {referenced.id}",
-                "units": 1.0,
-                "odds": -110,
-                "status": "pending",
-                "created_by": message.author.id,
-                "created_at": utc_now_iso(),
-                "graded_at": None,
-                "graded_by": None,
-                "result": None,
-                "profit_units": 0.0,
-            }
-
-            data["picks"].append(temp_pick)
-            save_data(data)
-
-            embed = build_pick_embed(temp_pick)
-            sent = await message.channel.send(
-                "Reply-based manual pick created from your graphic.",
-                embed=embed,
-                view=GradeView(temp_pick["id"]),
-            )
-
-            data["message_pick_map"][str(sent.id)] = temp_pick["id"]
-            save_data(data)
-
-            await bot.process_commands(message)
-            return
-
-        if result in {"win", "loss", "push"}:
-            manual_pick = {
-                "id": len(data["picks"]) + len(data["graded_history"]) + 1,
-                "bet": f"Manual graphic reply from message {referenced.id}",
-                "units": 1.0,
-                "odds": -110,
-                "status": "pending",
-                "created_by": message.author.id,
-                "created_at": utc_now_iso(),
-                "graded_at": None,
-                "graded_by": None,
-                "result": None,
-                "profit_units": 0.0,
-            }
-
-            data["picks"].append(manual_pick)
-            save_data(data)
-
-            ok, msg = apply_grade_to_pick(manual_pick, result, message.author.id)
-            await message.channel.send(msg)
-
-            if ok and message.guild:
-                await post_recap_if_configured(message.guild)
-
-            await bot.process_commands(message)
-            return
+                try:
+                    await wins_channel.send(embed=embed, files=files)
+                    await message.add_reaction("✅")
+                except Exception as e:
+                    print(f"Failed forwarding winner: {e}")
 
     await bot.process_commands(message)
 
@@ -453,59 +524,6 @@ async def record(interaction: discord.Interaction):
     await interaction.response.send_message(embed=build_record_embed())
 
 
-@bot.tree.command(name="add_pick", description="Add a new official pick")
-@app_commands.describe(
-    bet="Example: Luka Doncic 25+ Points",
-    units="How many units this play is worth",
-    odds="American odds like -110 or +145",
-)
-async def add_pick(
-    interaction: discord.Interaction,
-    bet: str,
-    units: float,
-    odds: int,
-):
-    if data.get("owner_id") and not is_owner_user(interaction.user.id):
-        await interaction.response.send_message(
-            "Only the owner can add official picks.",
-            ephemeral=True,
-        )
-        return
-
-    pick = {
-        "id": len(data["picks"]) + len(data["graded_history"]) + 1,
-        "bet": bet,
-        "units": float(units),
-        "odds": int(odds),
-        "status": "pending",
-        "created_by": interaction.user.id,
-        "created_at": utc_now_iso(),
-        "graded_at": None,
-        "graded_by": None,
-        "result": None,
-        "profit_units": 0.0,
-    }
-
-    data["picks"].append(pick)
-    save_data(data)
-
-    embed = build_pick_embed(pick)
-    view = GradeView(pick["id"])
-
-    await interaction.response.send_message(
-        content=f"📝 Pick #{pick['id']} added.",
-        embed=embed,
-        view=view,
-    )
-
-    try:
-        original = await interaction.original_response()
-        data["message_pick_map"][str(original.id)] = pick["id"]
-        save_data(data)
-    except Exception as e:
-        print(f"Could not map pick message: {e}")
-
-
 @bot.tree.command(name="pending", description="List pending official plays")
 async def pending(interaction: discord.Interaction):
     items = pending_picks()
@@ -517,7 +535,7 @@ async def pending(interaction: discord.Interaction):
     lines = ["📋 **Pending Picks**"]
     for idx, p in enumerate(items, start=1):
         lines.append(
-            f"{idx}. ID {p['id']} — {p['bet']} | {p['units']:.2f}U | {p['odds']:+d}"
+            f"{idx}. ID {p['id']} — {p['play_type'].title()} — {p['units']:.2f}U — #{p['source_channel_name']}"
         )
 
     await interaction.response.send_message("\n".join(lines))
@@ -535,20 +553,12 @@ async def pending(interaction: discord.Interaction):
         app_commands.Choice(name="push", value="push"),
     ]
 )
-async def grade(
-    interaction: discord.Interaction,
-    index: int,
-    result: app_commands.Choice[str],
-):
+async def grade(interaction: discord.Interaction, index: int, result: app_commands.Choice[str]):
     if data.get("owner_id") and not is_owner_user(interaction.user.id):
-        await interaction.response.send_message(
-            "Only the owner can grade official picks.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("Only the owner can grade official picks.", ephemeral=True)
         return
 
     items = pending_picks()
-
     if not items:
         await interaction.response.send_message("No pending picks to grade.")
         return
@@ -565,16 +575,7 @@ async def grade(
         return
 
     await interaction.response.send_message(msg)
-
     if interaction.guild:
-        for message_id, mapped_pick_id in list(data["message_pick_map"].items()):
-            if int(mapped_pick_id) == pick["id"]:
-                await disable_pick_buttons_for_message(
-                    interaction.channel,
-                    int(message_id),
-                    pick,
-                )
-                break
         await post_recap_if_configured(interaction.guild)
 
 
@@ -607,7 +608,7 @@ async def recap(interaction: discord.Interaction, count: Optional[int] = 10):
     for p in reversed(history):
         emoji = "✅" if p["result"] == "win" else "❌" if p["result"] == "loss" else "➖"
         lines.append(
-            f"{emoji} ID {p['id']} — {p['bet']} | {p['units']:.2f}U | {p['odds']:+d} | {format_profit(p['profit_units'])}"
+            f"{emoji} ID {p['id']} — {p['play_type'].title()} — {p['units']:.2f}U — {format_profit(p['profit_units'])}"
         )
 
     await interaction.followup.send("\n".join(lines))
@@ -617,7 +618,6 @@ async def recap(interaction: discord.Interaction, count: Optional[int] = 10):
 async def tailboard(interaction: discord.Interaction):
     rec = data["record"]
     total = rec["wins"] + rec["losses"] + rec["pushes"]
-
     msg = (
         "🏆 **Tailboard**\n"
         f"Official picks graded: {total}\n"
@@ -627,77 +627,48 @@ async def tailboard(interaction: discord.Interaction):
     await interaction.response.send_message(msg)
 
 
-settings_group = app_commands.Group(
-    name="settings",
-    description="Bot settings commands",
-)
+settings_group = app_commands.Group(name="settings", description="Bot settings commands")
 
 
 @settings_group.command(name="show", description="Show current settings")
 async def settings_show(interaction: discord.Interaction):
     owner_id = data.get("owner_id")
-    recap_channel_id = data.get("recap_channel_id")
-
     owner_text = f"<@{owner_id}>" if owner_id else "Not set"
-    recap_text = f"<#{recap_channel_id}>" if recap_channel_id else "Not set"
-    units_text = f"${float(data['unit_value']):,.2f}"
     dollars_text = "On" if data["show_dollars"] else "Off"
 
     msg = (
         "⚙️ **Current Settings**\n"
         f"Owner: {owner_text}\n"
-        f"Recap Channel: {recap_text}\n"
-        f"1 Unit Value: {units_text}\n"
-        f"Show Dollars: {dollars_text}"
+        f"1 Unit Value: ${float(data['unit_value']):,.2f}\n"
+        f"Show Dollars: {dollars_text}\n"
+        f"Tracked Pick Channels: {', '.join(TRACKED_PICK_CHANNELS.keys())}\n"
+        f"Win Submission Channels: {', '.join(WIN_SUBMISSION_CHANNELS)}"
     )
     await interaction.response.send_message(msg)
 
 
 @settings_group.command(name="set_owner", description="Set the owner user")
-async def settings_set_owner(
-    interaction: discord.Interaction,
-    user: discord.User,
-):
+async def settings_set_owner(interaction: discord.Interaction, user: discord.User):
     data["owner_id"] = user.id
     save_data(data)
-
     await interaction.response.send_message(f"👑 Owner set to {user.mention}")
 
 
-@settings_group.command(name="set_recap_channel", description="Set the daily recap channel")
-async def settings_set_recap_channel(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-):
-    data["recap_channel_id"] = channel.id
-    save_data(data)
-
-    await interaction.response.send_message(f"🧾 Recap channel set to {channel.mention}")
-
-
 @settings_group.command(name="set_unit_value", description="Set dollar value for 1 unit")
-async def settings_set_unit_value(
-    interaction: discord.Interaction,
-    amount: float,
-):
+async def settings_set_unit_value(interaction: discord.Interaction, amount: float):
     if amount <= 0:
         await interaction.response.send_message("Unit value must be greater than 0.")
         return
 
     data["unit_value"] = float(amount)
     save_data(data)
-
     await interaction.response.send_message(f"💵 1 unit is now set to ${amount:,.2f}")
 
 
 @settings_group.command(name="toggle_dollars", description="Turn dollar display on or off")
-async def settings_toggle_dollars(
-    interaction: discord.Interaction,
-    enabled: bool,
-):
+async def settings_toggle_dollars(interaction: discord.Interaction, enabled: bool):
     data["show_dollars"] = enabled
     save_data(data)
-
     state = "On" if enabled else "Off"
     await interaction.response.send_message(f"💰 Dollar display is now {state}")
 
@@ -705,7 +676,6 @@ async def settings_toggle_dollars(
 bot.tree.add_command(settings_group)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is not set in your environment variables.")
 
