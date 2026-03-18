@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
 load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 def csv_env(name: str, default: str = "") -> list[str]:
@@ -17,6 +20,7 @@ class Settings:
     token: str
     guild_id: int
     owner_user_id: int
+    db_path: str
     default_unit_value: float
     timezone: str
     tracked_channels_vip: list[str]
@@ -32,10 +36,12 @@ def load_settings() -> Settings:
     token = os.getenv("DISCORD_TOKEN", "")
     guild_id = int(os.getenv("GUILD_ID", "0"))
     owner_user_id = int(os.getenv("OWNER_ID", "0"))
+
     return Settings(
         token=token,
         guild_id=guild_id,
         owner_user_id=owner_user_id,
+        db_path=str(BASE_DIR / "data" / "database.db"),
         default_unit_value=float(os.getenv("DEFAULT_UNIT_VALUE", "50")),
         timezone=os.getenv("TIMEZONE", "America/New_York"),
         tracked_channels_vip=csv_env("TRACKED_CHANNELS_VIP", "live-bets,hammers-aka-singles,parlays"),
