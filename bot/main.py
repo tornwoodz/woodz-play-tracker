@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, time
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import discord
@@ -33,7 +33,7 @@ class PlayTrackerBot(commands.Bot):
         intents.messages = True
         super().__init__(command_prefix="!", intents=intents)
         self.settings = load_settings()
-        self.db = Database("data/tracker.db")
+        self.db = Database(self.settings.db_path)
         self.guild_obj = discord.Object(id=self.settings.guild_id) if self.settings.guild_id else None
         self.owner_user_id = self.settings.owner_user_id
 
@@ -120,7 +120,6 @@ class PlayTrackerBot(commands.Bot):
         view = TrackedPlayView(self, play_id)
         sent = await message.reply(embed=embed, view=view, mention_author=False)
 
-        # store reply message id as the tracked record's message id for persistent view stability if needed later
         await self.db.set_setting(f"reply_message:{play_id}", str(sent.id))
         self.add_view(view, message_id=sent.id)
 
