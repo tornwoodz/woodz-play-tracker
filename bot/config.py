@@ -31,7 +31,7 @@ class Settings:
 def load_settings() -> Settings:
     token = os.getenv("DISCORD_TOKEN", "")
     guild_id = int(os.getenv("GUILD_ID", "0"))
-    owner_user_id = int(os.getenv("OWNER_USER_ID", "0"))
+    owner_user_id = int(os.getenv("OWNER_ID", "0"))
     return Settings(
         token=token,
         guild_id=guild_id,
