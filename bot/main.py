@@ -3,17 +3,29 @@ import re
 import json
 import base64
 import urllib.parse
+from io import BytesIO
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import discord
 from discord.ext import commands
+
+import cv2
+import numpy as np
+from PIL import Image
+import pytesseract
 
 # =========================================================
 # CONFIG
 # =========================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+
+# Optional: if Railway/path needs explicit binary location later,
+# set TESSERACT_CMD in Railway Variables.
+TESSERACT_CMD = os.getenv("TESSERACT_CMD", "").strip()
+if TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 ALLOWED_CHANNEL_IDS = {
     1483485837810335744,  # hammers-aka-singles
@@ -28,6 +40,8 @@ ALLOWED_CHANNEL_IDS = {
 
 DATA_FILE = "picktrax_data.json"
 MAX_RECENT_SCAN_MESSAGES = 15
+MAX_ATTACHMENTS_TO_SCAN = 3
+MAX_OCR_CHARS = 7000
 
 # =========================================================
 # DISCORD SETUP
@@ -95,6 +109,23 @@ def clean_text_block(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
+def truncate(text: str, max_len: int = 1800) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+def safe_float(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+def compact_json_payload(data: Dict[str, Any]) -> str:
+    raw = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("utf-8")
+
 def has_image_attachment(message: discord.Message) -> bool:
     if not message.attachments:
         return False
@@ -105,7 +136,21 @@ def has_image_attachment(message: discord.Message) -> bool:
             return True
         if attachment.content_type and attachment.content_type.startswith("image/"):
             return True
+
     return False
+
+def get_image_attachments(message: discord.Message) -> List[discord.Attachment]:
+    image_attachments: List[discord.Attachment] = []
+
+    for attachment in message.attachments:
+        filename = attachment.filename.lower()
+        if filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            image_attachments.append(attachment)
+            continue
+        if attachment.content_type and attachment.content_type.startswith("image/"):
+            image_attachments.append(attachment)
+
+    return image_attachments
 
 def has_any_attachment(message: discord.Message) -> bool:
     return bool(message.attachments)
@@ -172,23 +217,6 @@ def get_record_text() -> str:
     record = data_store["record"]
     return f"Record: ✅ {record['wins']} - ❌ {record['losses']} - ➖ {record['pushes']}"
 
-def safe_float(value: Optional[str]) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-def compact_json_payload(data: Dict[str, Any]) -> str:
-    raw = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("utf-8")
-
-def truncate(text: str, max_len: int = 1800) -> str:
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 3] + "..."
-
 # =========================================================
 # AI-READY PLACEHOLDER
 # =========================================================
@@ -204,13 +232,14 @@ async def ai_brain_router(message: discord.Message, clean_text: str) -> Optional
             "- detect link requests\n"
             "- react with 🔗 on image posts that need linking\n"
             "- detect replied-to image posts too\n"
+            "- OCR bet slip images\n"
+            "- parse text-based slips into a deep link foundation payload\n"
             "- grade slips as win/loss/push\n"
-            "- track a basic record\n"
-            "- parse text-based slips into a deep link foundation payload\n\n"
+            "- track a basic record\n\n"
             "Next upgrades:\n"
-            "- OCR bet slip reading from screenshots\n"
             "- sportsbook-specific deep links\n"
-            "- auto leg extraction from images\n"
+            "- cleaner leg extraction from screenshots\n"
+            "- auto one-click link flow\n"
             "- AI recap generation\n"
             "- unit/profit tracking"
         )
@@ -233,19 +262,7 @@ async def get_referenced_message(message: discord.Message) -> Optional[discord.M
             return None
     return None
 
-async def get_target_image_message(message: discord.Message) -> Optional[discord.Message]:
-    if has_image_attachment(message):
-        return message
-
-    referenced = await get_referenced_message(message)
-    if referenced and has_image_attachment(referenced):
-        return referenced
-
-    return None
-
 async def get_recent_candidate_message(message: discord.Message) -> Optional[discord.Message]:
-    # Fallback for natural behavior: find the most recent non-bot message
-    # with content or attachments before the current command message.
     try:
         async for msg in message.channel.history(limit=MAX_RECENT_SCAN_MESSAGES + 1, before=message.created_at):
             if msg.author.bot:
@@ -259,21 +276,204 @@ async def get_recent_candidate_message(message: discord.Message) -> Optional[dis
     return None
 
 async def resolve_link_target_message(message: discord.Message) -> Optional[discord.Message]:
-    # 1) Same message
-    if has_any_attachment(message) or clean_text_block(message.content):
-        return message
-
-    # 2) Reply target
+    # Prefer replied message first because that is the strongest signal.
     referenced = await get_referenced_message(message)
     if referenced and (has_any_attachment(referenced) or clean_text_block(referenced.content)):
         return referenced
 
-    # 3) Recent fallback
+    # Then direct current message.
+    if has_any_attachment(message) or clean_text_block(message.content):
+        return message
+
+    # Then recent fallback.
     recent = await get_recent_candidate_message(message)
     if recent:
         return recent
 
     return None
+
+# =========================================================
+# OCR HELPERS
+# =========================================================
+
+def preprocess_image_variants(image_bytes: bytes) -> List[np.ndarray]:
+    pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    image = np.array(pil_image)
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+    # Upscale for sharper OCR
+    scale = 2
+    image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Variant 1: adaptive threshold
+    adaptive = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
+    )
+
+    # Variant 2: Otsu
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Variant 3: inverted for dark UIs
+    _, inv_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Variant 4: denoised + threshold
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, blur_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    return [gray, adaptive, otsu, inv_otsu, blur_otsu]
+
+def run_tesseract_pass(img: np.ndarray, config: str) -> str:
+    try:
+        return pytesseract.image_to_string(img, config=config) or ""
+    except Exception:
+        return ""
+
+def dedupe_ocr_blocks(blocks: List[str]) -> str:
+    seen = set()
+    cleaned_blocks: List[str] = []
+
+    for block in blocks:
+        block = clean_text_block(block)
+        if not block:
+            continue
+
+        block_lines = []
+        for line in block.split("\n"):
+            normalized = normalize_text(line)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            block_lines.append(line.strip())
+
+        if block_lines:
+            cleaned_blocks.append("\n".join(block_lines))
+
+    combined = "\n".join(cleaned_blocks)
+    return truncate(clean_text_block(combined), MAX_OCR_CHARS)
+
+async def ocr_attachment(attachment: discord.Attachment) -> str:
+    try:
+        image_bytes = await attachment.read()
+    except Exception:
+        return ""
+
+    variants = preprocess_image_variants(image_bytes)
+
+    configs = [
+        r"--oem 3 --psm 6",
+        r"--oem 3 --psm 11",
+        r"--oem 3 --psm 12",
+    ]
+
+    results: List[str] = []
+    for variant in variants:
+        for config in configs:
+            text = run_tesseract_pass(variant, config)
+            if text:
+                results.append(text)
+
+    return dedupe_ocr_blocks(results)
+
+def normalize_ocr_text(text: str) -> str:
+    text = text or ""
+
+    replacements = {
+        "Ower ": "Over ",
+        "Ouer ": "Over ",
+        "0ver ": "Over ",
+        "Undar ": "Under ",
+        "Monayline": "Moneyline",
+        "MONEYL INE": "MONEYLINE",
+        "MONEY LINE": "MONEYLINE",
+        "SPREAD BETTING": "SPREAD BETTING",
+        "TOTAL POINTS": "TOTAL POINTS",
+        "|": " ",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return clean_text_block(text)
+
+def build_candidate_leg_lines_from_ocr(text: str) -> List[str]:
+    text = normalize_ocr_text(text)
+    raw_lines = [ln.strip("•*- ").strip() for ln in text.split("\n")]
+    raw_lines = [ln for ln in raw_lines if ln]
+
+    candidates: List[str] = []
+    i = 0
+    while i < len(raw_lines):
+        line = raw_lines[i]
+        lower = line.lower()
+
+        # Pattern: Over/Under line + market + event on next lines
+        if re.search(r"\b(over|under)\s+\d+(?:\.\d+)?\b", lower):
+            combined = line
+            if i + 1 < len(raw_lines):
+                nxt = raw_lines[i + 1]
+                if any(k in nxt.lower() for k in ["total", "points", "rebounds", "assists", "spread", "betting"]):
+                    combined += f" | {nxt}"
+                    i += 1
+            if i + 1 < len(raw_lines):
+                nxt = raw_lines[i + 1]
+                if "@" in nxt:
+                    combined += f" | {nxt}"
+                    i += 1
+            candidates.append(combined)
+
+        # Pattern: Team moneyline
+        elif "moneyline" in lower:
+            prev_line = raw_lines[i - 1] if i - 1 >= 0 else ""
+            combined = line
+            if prev_line and "@" not in prev_line and not any(
+                k in prev_line.lower() for k in ["thu", "fri", "sat", "sun", "pm", "et", "total", "spread"]
+            ):
+                combined = f"{prev_line} | {line}"
+            if i + 1 < len(raw_lines) and "@" in raw_lines[i + 1]:
+                combined += f" | {raw_lines[i + 1]}"
+                i += 1
+            candidates.append(combined)
+
+        # Pattern: Team spread
+        elif re.search(r"[A-Za-z].*[+-]\d+(?:\.\d+)?", line) and (
+            i + 1 < len(raw_lines) and "spread" in raw_lines[i + 1].lower()
+        ):
+            combined = f"{line} | {raw_lines[i + 1]}"
+            if i + 2 < len(raw_lines) and "@" in raw_lines[i + 2]:
+                combined += f" | {raw_lines[i + 2]}"
+                i += 2
+            else:
+                i += 1
+            candidates.append(combined)
+
+        i += 1
+
+    # Also include raw lines that look leg-like
+    for line in raw_lines:
+        lower = line.lower()
+        if (
+            "@" in line
+            or "moneyline" in lower
+            or "spread" in lower
+            or "over " in lower
+            or "under " in lower
+        ):
+            candidates.append(line)
+
+    # Deduplicate while preserving order
+    out: List[str] = []
+    seen = set()
+    for line in candidates:
+        key = normalize_text(line)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(line)
+
+    return out
 
 # =========================================================
 # DEEP LINK FOUNDATION
@@ -297,7 +497,7 @@ def detect_sport_and_league(text: str) -> Dict[str, Optional[str]]:
 
     if any(k in lower for k in ["nba", "lakers", "celtics", "knicks", "warriors", "rockets"]):
         return {"sport": "basketball", "league": "NBA"}
-    if any(k in lower for k in ["ncaa", "ncaab", "march madness", "ohio state", "wisconsin", "vanderbilt", "louisville", "tcu", "nebraska"]):
+    if any(k in lower for k in ["ncaa", "ncaab", "march madness", "ohio state", "wisconsin", "vanderbilt", "louisville", "tcu", "nebraska", "south florida", "high point", "mcneese", "troy"]):
         return {"sport": "basketball", "league": "NCAAB"}
     if any(k in lower for k in ["nfl", "touchdown", "passing yards", "rushing yards"]):
         return {"sport": "football", "league": "NFL"}
@@ -313,7 +513,10 @@ def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
     if not raw_line:
         return None
 
+    # Make OCR-combined pipes easier to parse
+    raw_line = raw_line.replace(" | ", " - ")
     lower = raw_line.lower()
+
     leg = empty_leg()
     leg["raw"] = raw_line
 
@@ -321,46 +524,52 @@ def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
     leg["sport"] = meta["sport"]
     leg["league"] = meta["league"]
 
-    odds_match = re.search(r"([+-]\d{3,4}|[+-]\d{2})\b", raw_line)
+    odds_match = re.search(r"([+-]\d{2,4})\b", raw_line)
     if odds_match:
         leg["odds"] = odds_match.group(1)
 
-    # Event matcher
     event_match = re.search(r"([A-Za-z0-9 .&'/-]+)\s+@\s+([A-Za-z0-9 .&'/-]+)", raw_line)
     if event_match:
         leg["event"] = f"{event_match.group(1).strip()} @ {event_match.group(2).strip()}"
 
-    # Total points / over-under
+    # Over / Under totals
     ou_match = re.search(r"\b(over|under)\s+(\d+(?:\.\d+)?)\b", lower)
     if ou_match:
         leg["market_type"] = "total"
         leg["selection"] = ou_match.group(1).title()
         leg["line"] = safe_float(ou_match.group(2))
-        leg["confidence"] = 0.85
+        leg["confidence"] = 0.87
         return leg
 
     # Moneyline
     if "moneyline" in lower:
-        leg["market_type"] = "moneyline"
         cleaned = re.sub(r"\bmoneyline\b", "", raw_line, flags=re.IGNORECASE).strip(" -")
         cleaned = re.sub(r"\s+[+-]\d{2,4}\b", "", cleaned).strip(" -")
-        leg["selection"] = cleaned
-        leg["confidence"] = 0.8
+
+        # If OCR line has event after delimiter, keep first chunk as team
+        if " - " in cleaned:
+            first_chunk = cleaned.split(" - ")[0].strip()
+        else:
+            first_chunk = cleaned.strip()
+
+        leg["market_type"] = "moneyline"
+        leg["selection"] = first_chunk
+        leg["confidence"] = 0.82
         return leg
 
     # Spread
-    spread_match = re.search(r"([A-Za-z0-9 .&'/-]+)\s+([+-]\d+(?:\.\d+)?)\b", raw_line)
-    if spread_match and ("spread" in lower or not ou_match):
-        team_candidate = spread_match.group(1).strip()
+    spread_match = re.search(r"([A-Za-z0-9 .&'/-]+?)\s+([+-]\d+(?:\.\d+)?)\b", raw_line)
+    if spread_match:
+        team_candidate = spread_match.group(1).strip(" -")
         line_candidate = spread_match.group(2)
         if team_candidate and not team_candidate.lower().startswith(("over", "under")):
             leg["market_type"] = "spread"
             leg["selection"] = team_candidate
             leg["line"] = safe_float(line_candidate)
-            leg["confidence"] = 0.72
+            leg["confidence"] = 0.76
             return leg
 
-    # Player prop patterns
+    # Player props
     player_prop_match = re.search(
         r"([A-Za-z .'-]+)\s+(\d+(?:\.\d+)?\+?)\s*(points|pts|rebounds|reb|assists|ast|pra|threes|3pm|hits|shots|goals)",
         lower,
@@ -369,11 +578,8 @@ def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
     if player_prop_match:
         leg["market_type"] = "player_prop"
         leg["selection"] = player_prop_match.group(1).title().strip()
-        raw_line_val = player_prop_match.group(2).replace("+", "")
-        leg["line"] = safe_float(raw_line_val)
-        stat = player_prop_match.group(3).lower()
-        leg["event"] = leg["event"] or stat.upper()
-        leg["confidence"] = 0.7
+        leg["line"] = safe_float(player_prop_match.group(2).replace("+", ""))
+        leg["confidence"] = 0.70
         return leg
 
     return None
@@ -397,30 +603,40 @@ def parse_legs_from_text(text: str) -> List[Dict[str, Any]]:
 
     return parsed
 
+def parse_legs_from_ocr_text(ocr_text: str) -> List[Dict[str, Any]]:
+    candidate_lines = build_candidate_leg_lines_from_ocr(ocr_text)
+
+    parsed: List[Dict[str, Any]] = []
+    seen_raw = set()
+
+    for line in candidate_lines:
+        leg = parse_single_leg_from_line(line)
+        if leg and leg["raw"] not in seen_raw:
+            seen_raw.add(leg["raw"])
+            parsed.append(leg)
+
+    return parsed
+
 def build_canonical_slip(legs: List[Dict[str, Any]], source_message: discord.Message) -> Dict[str, Any]:
-    created_at = datetime.now(timezone.utc).isoformat()
-    payload = {
-        "version": "1.0",
+    return {
+        "version": "1.1",
         "source_message_id": str(source_message.id),
         "source_channel_id": str(source_message.channel.id),
         "source_author_id": str(source_message.author.id),
-        "created_at": created_at,
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "legs": legs,
         "leg_count": len(legs),
     }
-    return payload
 
 def build_picktrax_internal_link(payload: Dict[str, Any]) -> str:
     encoded = compact_json_payload(payload)
     return f"picktrax://slip?payload={encoded}"
 
 def build_picktrax_web_preview_link(payload: Dict[str, Any]) -> str:
-    # Placeholder preview route for future web app/site
     encoded = compact_json_payload(payload)
     return f"https://picktrax.app/slip?payload={urllib.parse.quote(encoded)}"
 
 def book_adapter_fanduel(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Foundation only: sportsbook-specific mapping comes next
     return {
         "book": "FanDuel",
         "status": "foundation_ready",
@@ -465,14 +681,19 @@ def format_leg_summary(leg: Dict[str, Any], idx: int) -> str:
         parts.append(f"[{leg['odds']}]")
     return " ".join(parts)
 
+# =========================================================
+# EXTRACTION PIPELINE
+# =========================================================
+
 async def extract_text_from_target_message(message: discord.Message) -> str:
     pieces: List[str] = []
 
+    # Message content
     content = clean_text_block(message.content)
     if content:
         pieces.append(content)
 
-    # Pull embed text when available
+    # Embeds
     for embed in message.embeds:
         if embed.title:
             pieces.append(embed.title)
@@ -485,6 +706,44 @@ async def extract_text_from_target_message(message: discord.Message) -> str:
                 pieces.append(field.value)
 
     return clean_text_block("\n".join(pieces))
+
+async def extract_ocr_from_target_message(message: discord.Message) -> str:
+    image_attachments = get_image_attachments(message)[:MAX_ATTACHMENTS_TO_SCAN]
+    if not image_attachments:
+        return ""
+
+    ocr_blocks: List[str] = []
+    for attachment in image_attachments:
+        text = await ocr_attachment(attachment)
+        text = normalize_ocr_text(text)
+        if text:
+            ocr_blocks.append(text)
+
+    return clean_text_block("\n\n".join(ocr_blocks))
+
+async def extract_structured_legs_from_message(target_message: discord.Message) -> Tuple[List[Dict[str, Any]], str, str]:
+    # 1. Native text / embed text first
+    target_text = await extract_text_from_target_message(target_message)
+    parsed_legs = parse_legs_from_text(target_text)
+    ocr_text = ""
+
+    # 2. OCR fallback or supplement
+    if has_image_attachment(target_message):
+        ocr_text = await extract_ocr_from_target_message(target_message)
+        ocr_legs = parse_legs_from_ocr_text(ocr_text)
+
+        # Prefer OCR if native text got nothing, otherwise merge
+        if not parsed_legs:
+            parsed_legs = ocr_legs
+        else:
+            seen = {normalize_text(leg.get("raw", "")) for leg in parsed_legs}
+            for leg in ocr_legs:
+                key = normalize_text(leg.get("raw", ""))
+                if key and key not in seen:
+                    parsed_legs.append(leg)
+                    seen.add(key)
+
+    return parsed_legs, target_text, ocr_text
 
 # =========================================================
 # GRADE HANDLER
@@ -527,27 +786,32 @@ async def handle_grade(message: discord.Message, result: str) -> None:
 async def handle_link_request(message: discord.Message) -> None:
     target_message = await resolve_link_target_message(message)
 
-    if target_message and has_image_attachment(target_message):
+    if not target_message:
+        await message.reply(
+            "I got you! I just need a slip message, image, or reply target to work from.",
+            mention_author=False
+        )
+        return
+
+    if has_image_attachment(target_message):
         try:
             await target_message.add_reaction("🔗")
         except Exception:
             pass
 
-    target_text = ""
-    if target_message:
-        target_text = await extract_text_from_target_message(target_message)
-
-    parsed_legs = parse_legs_from_text(target_text)
+    parsed_legs, native_text, ocr_text = await extract_structured_legs_from_message(target_message)
     payload = None
     adapters: List[Dict[str, Any]] = []
 
-    if parsed_legs and target_message:
+    if parsed_legs:
         payload = build_canonical_slip(parsed_legs, target_message)
         adapters = build_book_adapters(payload)
 
         data_store["parsed_slips"].append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "payload": payload
+            "payload": payload,
+            "native_text": truncate(native_text, 2000),
+            "ocr_text": truncate(ocr_text, 2000),
         })
         save_data(data_store)
 
@@ -555,7 +819,7 @@ async def handle_link_request(message: discord.Message) -> None:
 
     if parsed_legs and payload:
         response_lines.append("")
-        response_lines.append(f"**Deep Link Foundation Ready**")
+        response_lines.append("**Deep Link Foundation Ready**")
         response_lines.append(f"Recognized **{len(parsed_legs)}** leg(s).")
         response_lines.append("")
         response_lines.extend(format_leg_summary(leg, idx + 1) for idx, leg in enumerate(parsed_legs))
@@ -566,10 +830,23 @@ async def handle_link_request(message: discord.Message) -> None:
         response_lines.append("**Book Adapters**")
         for adapter in adapters:
             response_lines.append(f"- {adapter['book']}: {adapter['status']}")
+
+        if ocr_text:
+            response_lines.append("")
+            response_lines.append("**OCR Status**")
+            response_lines.append("Slip image read successfully.")
     else:
         response_lines.append("")
-        response_lines.append("I found the slip target, but I still need OCR or text-based legs to turn it into sportsbook-ready deep links.")
-        response_lines.append("Foundation is installed. Next step is OCR + book mapping.")
+        if has_image_attachment(target_message):
+            response_lines.append("OCR ran, but I couldn’t confidently structure the legs yet.")
+            if ocr_text:
+                response_lines.append("")
+                response_lines.append("**OCR Preview**")
+                response_lines.append(f"```{truncate(ocr_text, 800)}```")
+            response_lines.append("")
+            response_lines.append("Foundation is installed. Next step would be improving sport/book-specific parsing.")
+        else:
+            response_lines.append("I found the target, but I still need readable slip text or an image to build the deep link payload.")
 
     try:
         await message.reply("\n".join(response_lines), mention_author=False)
@@ -580,7 +857,7 @@ async def handle_link_request(message: discord.Message) -> None:
             pass
 
 # =========================================================
-# COMMANDS / UTILITIES
+# COMMANDS
 # =========================================================
 
 @bot.command(name="record")
@@ -626,6 +903,21 @@ async def parselegs_command(ctx: commands.Context, *, text: Optional[str] = None
     lines = [f"Parsed **{len(parsed)}** leg(s):"]
     lines.extend(format_leg_summary(leg, idx + 1) for idx, leg in enumerate(parsed))
     await ctx.send("\n".join(lines))
+
+@bot.command(name="ocrtest")
+async def ocrtest_command(ctx: commands.Context):
+    target_message = await resolve_link_target_message(ctx.message)
+
+    if not target_message or not has_image_attachment(target_message):
+        await ctx.send("Reply to an image slip with `!ocrtest`.")
+        return
+
+    ocr_text = await extract_ocr_from_target_message(target_message)
+    if not ocr_text:
+        await ctx.send("OCR didn’t return readable text.")
+        return
+
+    await ctx.send(f"**OCR Preview**\n```{truncate(ocr_text, 1500)}```")
 
 # =========================================================
 # EVENTS
