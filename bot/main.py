@@ -21,11 +21,11 @@ import pytesseract
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Optional: if Railway/path needs explicit binary location later,
-# set TESSERACT_CMD in Railway Variables.
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "").strip()
 if TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+ENV_OWNER_ID = os.getenv("OWNER_ID", "").strip()
 
 ALLOWED_CHANNEL_IDS = {
     1483485837810335744,  # hammers-aka-singles
@@ -52,6 +52,7 @@ intents.message_content = True
 intents.guilds = True
 intents.messages = True
 intents.reactions = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -60,6 +61,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # =========================================================
 
 def default_store() -> Dict[str, Any]:
+    owner_id = int(ENV_OWNER_ID) if ENV_OWNER_ID.isdigit() else None
     return {
         "graded_slips": [],
         "record": {
@@ -67,7 +69,10 @@ def default_store() -> Dict[str, Any]:
             "losses": 0,
             "pushes": 0
         },
-        "parsed_slips": []
+        "parsed_slips": [],
+        "settings": {
+            "owner_id": owner_id
+        }
     }
 
 def load_data() -> Dict[str, Any]:
@@ -84,6 +89,10 @@ def load_data() -> Dict[str, Any]:
             loaded["record"] = {"wins": 0, "losses": 0, "pushes": 0}
         if "parsed_slips" not in loaded:
             loaded["parsed_slips"] = []
+        if "settings" not in loaded:
+            loaded["settings"] = {"owner_id": None}
+        if "owner_id" not in loaded["settings"]:
+            loaded["settings"]["owner_id"] = int(ENV_OWNER_ID) if ENV_OWNER_ID.isdigit() else None
 
         return loaded
     except Exception:
@@ -141,7 +150,6 @@ def has_image_attachment(message: discord.Message) -> bool:
 
 def get_image_attachments(message: discord.Message) -> List[discord.Attachment]:
     image_attachments: List[discord.Attachment] = []
-
     for attachment in message.attachments:
         filename = attachment.filename.lower()
         if filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
@@ -149,7 +157,6 @@ def get_image_attachments(message: discord.Message) -> List[discord.Attachment]:
             continue
         if attachment.content_type and attachment.content_type.startswith("image/"):
             image_attachments.append(attachment)
-
     return image_attachments
 
 def has_any_attachment(message: discord.Message) -> bool:
@@ -161,36 +168,41 @@ def message_has_picktrax_mention(message: discord.Message) -> bool:
 def is_allowed_channel(message: discord.Message) -> bool:
     return message.channel.id in ALLOWED_CHANNEL_IDS
 
+def get_owner_id() -> Optional[int]:
+    owner_id = data_store.get("settings", {}).get("owner_id")
+    if isinstance(owner_id, int):
+        return owner_id
+    if isinstance(owner_id, str) and owner_id.isdigit():
+        return int(owner_id)
+    if ENV_OWNER_ID.isdigit():
+        return int(ENV_OWNER_ID)
+    return None
+
+def set_owner_id(owner_id: int) -> None:
+    if "settings" not in data_store:
+        data_store["settings"] = {}
+    data_store["settings"]["owner_id"] = owner_id
+    save_data(data_store)
+
+def user_is_owner(user_id: int) -> bool:
+    owner_id = get_owner_id()
+    return owner_id is not None and owner_id == user_id
+
+def get_record_text() -> str:
+    record = data_store["record"]
+    return f"Record: ✅ {record['wins']} - ❌ {record['losses']} - ➖ {record['pushes']}"
+
 def is_link_request(text: str) -> bool:
     text = normalize_text(text)
-
     link_patterns = [
-        "link it",
-        "link this",
-        "send the link",
-        "drop the link",
-        "need the link",
-        "give me the link",
-        "post the link",
-        "where the link",
-        "make the link",
-        "build the link",
-        "create the link",
-        "get the link",
-        "can you link",
-        "link that",
-        "link these",
-        "link slip",
-        "link betslip",
-        "one click",
-        "one-click",
-        "deeplink",
-        "deep link",
+        "link it", "link this", "send the link", "drop the link", "need the link",
+        "give me the link", "post the link", "where the link", "make the link",
+        "build the link", "create the link", "get the link", "can you link",
+        "link that", "link these", "link slip", "link betslip",
+        "one click", "one-click", "deeplink", "deep link",
     ]
-
     if "link" in text or "deeplink" in text or "deep link" in text:
         return True
-
     return any(p in text for p in link_patterns)
 
 def detect_grade_action(text: str) -> Optional[str]:
@@ -213,9 +225,26 @@ def detect_grade_action(text: str) -> Optional[str]:
 
     return None
 
-def get_record_text() -> str:
-    record = data_store["record"]
-    return f"Record: ✅ {record['wins']} - ❌ {record['losses']} - ➖ {record['pushes']}"
+def detect_ping_request(text: str) -> bool:
+    text = normalize_text(text)
+    return any(p in text for p in [" ping", " ping?", "ping", "are you up", "you there", "status"])
+
+def detect_show_record_request(text: str) -> bool:
+    text = normalize_text(text)
+    patterns = [
+        "show record", "show my record", "record", "show stats", "stats",
+        "show tracker", "what's the record", "whats the record", "current record"
+    ]
+    return any(p in text for p in patterns)
+
+def detect_who_is_owner_request(text: str) -> bool:
+    text = normalize_text(text)
+    patterns = ["who is owner", "who's owner", "whos owner", "show owner", "owner?"]
+    return any(p in text for p in patterns)
+
+def detect_set_owner_request(text: str) -> bool:
+    text = normalize_text(text)
+    return "set owner" in text or "make owner" in text or "owner is" in text
 
 # =========================================================
 # AI-READY PLACEHOLDER
@@ -235,13 +264,15 @@ async def ai_brain_router(message: discord.Message, clean_text: str) -> Optional
             "- OCR bet slip images\n"
             "- parse text-based slips into a deep link foundation payload\n"
             "- grade slips as win/loss/push\n"
-            "- track a basic record\n\n"
-            "Next upgrades:\n"
-            "- sportsbook-specific deep links\n"
-            "- cleaner leg extraction from screenshots\n"
-            "- auto one-click link flow\n"
-            "- AI recap generation\n"
-            "- unit/profit tracking"
+            "- track a basic record\n"
+            "- answer ping / owner / record requests by mention\n\n"
+            "Examples:\n"
+            "- `@Pick Trax ping`\n"
+            "- `@Pick Trax show record`\n"
+            "- `@Pick Trax who is owner`\n"
+            "- `@Pick Trax set owner @user`\n"
+            "- `@Pick Trax link this`\n"
+            "- `@Pick Trax grade this a win`\n"
         )
 
     return None
@@ -276,16 +307,13 @@ async def get_recent_candidate_message(message: discord.Message) -> Optional[dis
     return None
 
 async def resolve_link_target_message(message: discord.Message) -> Optional[discord.Message]:
-    # Prefer replied message first because that is the strongest signal.
     referenced = await get_referenced_message(message)
     if referenced and (has_any_attachment(referenced) or clean_text_block(referenced.content)):
         return referenced
 
-    # Then direct current message.
     if has_any_attachment(message) or clean_text_block(message.content):
         return message
 
-    # Then recent fallback.
     recent = await get_recent_candidate_message(message)
     if recent:
         return recent
@@ -300,25 +328,15 @@ def preprocess_image_variants(image_bytes: bytes) -> List[np.ndarray]:
     pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
     image = np.array(pil_image)
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-    # Upscale for sharper OCR
-    scale = 2
-    image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    image = cv2.resize(image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # Variant 1: adaptive threshold
     adaptive = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
     )
-
-    # Variant 2: Otsu
     _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Variant 3: inverted for dark UIs
     _, inv_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # Variant 4: denoised + threshold
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     _, blur_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
@@ -360,7 +378,6 @@ async def ocr_attachment(attachment: discord.Attachment) -> str:
         return ""
 
     variants = preprocess_image_variants(image_bytes)
-
     configs = [
         r"--oem 3 --psm 6",
         r"--oem 3 --psm 11",
@@ -378,7 +395,6 @@ async def ocr_attachment(attachment: discord.Attachment) -> str:
 
 def normalize_ocr_text(text: str) -> str:
     text = text or ""
-
     replacements = {
         "Ower ": "Over ",
         "Ouer ": "Over ",
@@ -387,8 +403,6 @@ def normalize_ocr_text(text: str) -> str:
         "Monayline": "Moneyline",
         "MONEYL INE": "MONEYLINE",
         "MONEY LINE": "MONEYLINE",
-        "SPREAD BETTING": "SPREAD BETTING",
-        "TOTAL POINTS": "TOTAL POINTS",
         "|": " ",
     }
 
@@ -410,7 +424,6 @@ def build_candidate_leg_lines_from_ocr(text: str) -> List[str]:
         line = raw_lines[i]
         lower = line.lower()
 
-        # Pattern: Over/Under line + market + event on next lines
         if re.search(r"\b(over|under)\s+\d+(?:\.\d+)?\b", lower):
             combined = line
             if i + 1 < len(raw_lines):
@@ -425,7 +438,6 @@ def build_candidate_leg_lines_from_ocr(text: str) -> List[str]:
                     i += 1
             candidates.append(combined)
 
-        # Pattern: Team moneyline
         elif "moneyline" in lower:
             prev_line = raw_lines[i - 1] if i - 1 >= 0 else ""
             combined = line
@@ -438,7 +450,6 @@ def build_candidate_leg_lines_from_ocr(text: str) -> List[str]:
                 i += 1
             candidates.append(combined)
 
-        # Pattern: Team spread
         elif re.search(r"[A-Za-z].*[+-]\d+(?:\.\d+)?", line) and (
             i + 1 < len(raw_lines) and "spread" in raw_lines[i + 1].lower()
         ):
@@ -452,19 +463,11 @@ def build_candidate_leg_lines_from_ocr(text: str) -> List[str]:
 
         i += 1
 
-    # Also include raw lines that look leg-like
     for line in raw_lines:
         lower = line.lower()
-        if (
-            "@" in line
-            or "moneyline" in lower
-            or "spread" in lower
-            or "over " in lower
-            or "under " in lower
-        ):
+        if "@" in line or "moneyline" in lower or "spread" in lower or "over " in lower or "under " in lower:
             candidates.append(line)
 
-    # Deduplicate while preserving order
     out: List[str] = []
     seen = set()
     for line in candidates:
@@ -513,7 +516,6 @@ def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
     if not raw_line:
         return None
 
-    # Make OCR-combined pipes easier to parse
     raw_line = raw_line.replace(" | ", " - ")
     lower = raw_line.lower()
 
@@ -532,7 +534,6 @@ def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
     if event_match:
         leg["event"] = f"{event_match.group(1).strip()} @ {event_match.group(2).strip()}"
 
-    # Over / Under totals
     ou_match = re.search(r"\b(over|under)\s+(\d+(?:\.\d+)?)\b", lower)
     if ou_match:
         leg["market_type"] = "total"
@@ -541,12 +542,9 @@ def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
         leg["confidence"] = 0.87
         return leg
 
-    # Moneyline
     if "moneyline" in lower:
         cleaned = re.sub(r"\bmoneyline\b", "", raw_line, flags=re.IGNORECASE).strip(" -")
         cleaned = re.sub(r"\s+[+-]\d{2,4}\b", "", cleaned).strip(" -")
-
-        # If OCR line has event after delimiter, keep first chunk as team
         if " - " in cleaned:
             first_chunk = cleaned.split(" - ")[0].strip()
         else:
@@ -557,7 +555,6 @@ def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
         leg["confidence"] = 0.82
         return leg
 
-    # Spread
     spread_match = re.search(r"([A-Za-z0-9 .&'/-]+?)\s+([+-]\d+(?:\.\d+)?)\b", raw_line)
     if spread_match:
         team_candidate = spread_match.group(1).strip(" -")
@@ -569,7 +566,6 @@ def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
             leg["confidence"] = 0.76
             return leg
 
-    # Player props
     player_prop_match = re.search(
         r"([A-Za-z .'-]+)\s+(\d+(?:\.\d+)?\+?)\s*(points|pts|rebounds|reb|assists|ast|pra|threes|3pm|hits|shots|goals)",
         lower,
@@ -584,6 +580,50 @@ def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
 
     return None
 
+def canonical_leg_key(leg: Dict[str, Any]) -> str:
+    selection = normalize_text(str(leg.get("selection") or ""))
+    market_type = normalize_text(str(leg.get("market_type") or ""))
+    line = str(leg.get("line") if leg.get("line") is not None else "")
+    event = normalize_text(str(leg.get("event") or ""))
+    odds = str(leg.get("odds") or "")
+    return "|".join([selection, market_type, line, event, odds])
+
+def clean_and_dedupe_legs(legs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best_by_key: Dict[str, Dict[str, Any]] = {}
+
+    for leg in legs:
+        if not leg.get("selection") and not leg.get("event"):
+            continue
+
+        key = canonical_leg_key(leg)
+        if not key.strip("|"):
+            continue
+
+        existing = best_by_key.get(key)
+        if existing is None:
+            best_by_key[key] = leg
+            continue
+
+        if float(leg.get("confidence", 0.0)) > float(existing.get("confidence", 0.0)):
+            best_by_key[key] = leg
+
+    cleaned = list(best_by_key.values())
+
+    filtered: List[Dict[str, Any]] = []
+    for leg in cleaned:
+        market_type = (leg.get("market_type") or "").lower()
+        selection = normalize_text(str(leg.get("selection") or ""))
+
+        if market_type == "moneyline" and selection in {"moneyline", "m", ""}:
+            continue
+        if market_type == "spread" and selection in {"spread", "betting", ""}:
+            continue
+
+        filtered.append(leg)
+
+    filtered.sort(key=lambda x: (-float(x.get("confidence", 0.0)), normalize_text(str(x.get("selection") or ""))))
+    return filtered[:12]
+
 def parse_legs_from_text(text: str) -> List[Dict[str, Any]]:
     text = clean_text_block(text)
     if not text:
@@ -593,33 +633,26 @@ def parse_legs_from_text(text: str) -> List[Dict[str, Any]]:
     raw_lines = [ln for ln in raw_lines if ln]
 
     parsed: List[Dict[str, Any]] = []
-    seen_raw = set()
-
     for line in raw_lines:
         leg = parse_single_leg_from_line(line)
-        if leg and leg["raw"] not in seen_raw:
+        if leg:
             parsed.append(leg)
-            seen_raw.add(leg["raw"])
 
-    return parsed
+    return clean_and_dedupe_legs(parsed)
 
 def parse_legs_from_ocr_text(ocr_text: str) -> List[Dict[str, Any]]:
     candidate_lines = build_candidate_leg_lines_from_ocr(ocr_text)
-
     parsed: List[Dict[str, Any]] = []
-    seen_raw = set()
-
     for line in candidate_lines:
         leg = parse_single_leg_from_line(line)
-        if leg and leg["raw"] not in seen_raw:
-            seen_raw.add(leg["raw"])
+        if leg:
             parsed.append(leg)
 
-    return parsed
+    return clean_and_dedupe_legs(parsed)
 
 def build_canonical_slip(legs: List[Dict[str, Any]], source_message: discord.Message) -> Dict[str, Any]:
     return {
-        "version": "1.1",
+        "version": "1.2",
         "source_message_id": str(source_message.id),
         "source_channel_id": str(source_message.channel.id),
         "source_author_id": str(source_message.author.id),
@@ -632,33 +665,14 @@ def build_picktrax_internal_link(payload: Dict[str, Any]) -> str:
     encoded = compact_json_payload(payload)
     return f"picktrax://slip?payload={encoded}"
 
-def build_picktrax_web_preview_link(payload: Dict[str, Any]) -> str:
-    encoded = compact_json_payload(payload)
-    return f"https://picktrax.app/slip?payload={urllib.parse.quote(encoded)}"
-
 def book_adapter_fanduel(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "book": "FanDuel",
-        "status": "foundation_ready",
-        "url": None,
-        "reason": "Adapter scaffold created. Exact FanDuel mapping not added yet."
-    }
+    return {"book": "FanDuel", "status": "foundation_ready", "url": None}
 
 def book_adapter_draftkings(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "book": "DraftKings",
-        "status": "foundation_ready",
-        "url": None,
-        "reason": "Adapter scaffold created. Exact DraftKings mapping not added yet."
-    }
+    return {"book": "DraftKings", "status": "foundation_ready", "url": None}
 
 def book_adapter_hardrock(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "book": "Hard Rock",
-        "status": "foundation_ready",
-        "url": None,
-        "reason": "Adapter scaffold created. Exact Hard Rock mapping not added yet."
-    }
+    return {"book": "Hard Rock", "status": "foundation_ready", "url": None}
 
 def build_book_adapters(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [
@@ -688,12 +702,10 @@ def format_leg_summary(leg: Dict[str, Any], idx: int) -> str:
 async def extract_text_from_target_message(message: discord.Message) -> str:
     pieces: List[str] = []
 
-    # Message content
     content = clean_text_block(message.content)
     if content:
         pieces.append(content)
 
-    # Embeds
     for embed in message.embeds:
         if embed.title:
             pieces.append(embed.title)
@@ -722,28 +734,95 @@ async def extract_ocr_from_target_message(message: discord.Message) -> str:
     return clean_text_block("\n\n".join(ocr_blocks))
 
 async def extract_structured_legs_from_message(target_message: discord.Message) -> Tuple[List[Dict[str, Any]], str, str]:
-    # 1. Native text / embed text first
     target_text = await extract_text_from_target_message(target_message)
     parsed_legs = parse_legs_from_text(target_text)
     ocr_text = ""
 
-    # 2. OCR fallback or supplement
     if has_image_attachment(target_message):
         ocr_text = await extract_ocr_from_target_message(target_message)
         ocr_legs = parse_legs_from_ocr_text(ocr_text)
 
-        # Prefer OCR if native text got nothing, otherwise merge
         if not parsed_legs:
             parsed_legs = ocr_legs
         else:
-            seen = {normalize_text(leg.get("raw", "")) for leg in parsed_legs}
-            for leg in ocr_legs:
-                key = normalize_text(leg.get("raw", ""))
-                if key and key not in seen:
-                    parsed_legs.append(leg)
-                    seen.add(key)
+            merged = parsed_legs + ocr_legs
+            parsed_legs = clean_and_dedupe_legs(merged)
 
     return parsed_legs, target_text, ocr_text
+
+# =========================================================
+# OWNER / SMART COMMAND HELPERS
+# =========================================================
+
+async def resolve_owner_target_user(message: discord.Message) -> Optional[discord.Member]:
+    non_bot_mentions = [m for m in message.mentions if bot.user is None or m.id != bot.user.id]
+    if non_bot_mentions:
+        member = non_bot_mentions[0]
+        if isinstance(member, discord.Member):
+            return member
+
+    referenced = await get_referenced_message(message)
+    if referenced and isinstance(referenced.author, discord.Member):
+        return referenced.author
+
+    text = normalize_text(message.content)
+    if "set owner me" in text or "make me owner" in text:
+        if isinstance(message.author, discord.Member):
+            return message.author
+
+    id_match = re.search(r"\b(\d{17,20})\b", message.content or "")
+    if id_match and message.guild:
+        try:
+            member = message.guild.get_member(int(id_match.group(1)))
+            if member:
+                return member
+        except Exception:
+            pass
+
+    return None
+
+async def handle_ping_request(message: discord.Message) -> None:
+    latency_ms = round(bot.latency * 1000)
+    owner_id = get_owner_id()
+    owner_note = f"\nOwner ID: `{owner_id}`" if owner_id else "\nOwner ID: `not set`"
+    await message.reply(f"🏓 Pong! `{latency_ms}ms`{owner_note}", mention_author=False)
+
+async def handle_show_record_request(message: discord.Message) -> None:
+    await message.reply(f"📊 {get_record_text()}", mention_author=False)
+
+async def handle_who_is_owner_request(message: discord.Message) -> None:
+    owner_id = get_owner_id()
+    if not owner_id:
+        await message.reply("👑 No owner is set right now.", mention_author=False)
+        return
+
+    member = None
+    if message.guild:
+        member = message.guild.get_member(owner_id)
+
+    if member:
+        await message.reply(f"👑 Current owner: {member.mention} (`{owner_id}`)", mention_author=False)
+    else:
+        await message.reply(f"👑 Current owner ID: `{owner_id}`", mention_author=False)
+
+async def handle_set_owner_request(message: discord.Message) -> None:
+    current_owner_id = get_owner_id()
+
+    # Only current owner can change it, unless none exists yet.
+    if current_owner_id is not None and message.author.id != current_owner_id:
+        await message.reply("🚫 Only the current owner can change the owner setting.", mention_author=False)
+        return
+
+    target_user = await resolve_owner_target_user(message)
+    if not target_user:
+        await message.reply(
+            "I got you — reply to someone, mention someone, use `set owner me`, or include a user ID.",
+            mention_author=False
+        )
+        return
+
+    set_owner_id(target_user.id)
+    await message.reply(f"👑 Owner set to {target_user.mention} (`{target_user.id}`)", mention_author=False)
 
 # =========================================================
 # GRADE HANDLER
@@ -857,7 +936,7 @@ async def handle_link_request(message: discord.Message) -> None:
             pass
 
 # =========================================================
-# COMMANDS
+# TEXT COMMANDS
 # =========================================================
 
 @bot.command(name="record")
@@ -867,11 +946,7 @@ async def record_command(ctx: commands.Context):
 @bot.command(name="resetrecord")
 @commands.has_permissions(administrator=True)
 async def reset_record_command(ctx: commands.Context):
-    data_store["record"] = {
-        "wins": 0,
-        "losses": 0,
-        "pushes": 0
-    }
+    data_store["record"] = {"wins": 0, "losses": 0, "pushes": 0}
     data_store["graded_slips"] = []
     save_data(data_store)
     await ctx.send("📊 Record reset.")
@@ -882,13 +957,16 @@ async def picktrax_help(ctx: commands.Context):
     await ctx.send(
         "**Pick Trax Commands**\n"
         "`!record` → shows current record\n"
-        "`!resetrecord` → resets tracked record (admin only)\n\n"
+        "`!resetrecord` → resets tracked record (admin only)\n"
+        "`!ocrtest` → OCR preview on a replied slip image\n\n"
         "**Mention Triggers**\n"
-        f"`@{bot_name} link it` → replies and starts deep link flow\n"
-        f"`@{bot_name} link this` while replying to a message/image → reacts 🔗 and processes target\n"
-        f"`@{bot_name} grade this a loss` → grades loss\n"
-        f"`@{bot_name} grade this a win` → grades win\n"
-        f"`@{bot_name} grade this a push` → grades push"
+        f"`@{bot_name} ping`\n"
+        f"`@{bot_name} show record`\n"
+        f"`@{bot_name} who is owner`\n"
+        f"`@{bot_name} set owner @user`\n"
+        f"`@{bot_name} set owner me`\n"
+        f"`@{bot_name} link this`\n"
+        f"`@{bot_name} grade this a win/loss/push`\n"
     )
 
 @bot.command(name="parselegs")
@@ -941,6 +1019,27 @@ async def on_message(message: discord.Message):
     clean_text = normalize_text(content)
 
     if message_has_picktrax_mention(message):
+        # Mention-based modern AI commands
+        if detect_set_owner_request(clean_text):
+            await handle_set_owner_request(message)
+            await bot.process_commands(message)
+            return
+
+        if detect_who_is_owner_request(clean_text):
+            await handle_who_is_owner_request(message)
+            await bot.process_commands(message)
+            return
+
+        if detect_show_record_request(clean_text):
+            await handle_show_record_request(message)
+            await bot.process_commands(message)
+            return
+
+        if detect_ping_request(clean_text):
+            await handle_ping_request(message)
+            await bot.process_commands(message)
+            return
+
         if is_link_request(clean_text):
             await handle_link_request(message)
             await bot.process_commands(message)
@@ -959,7 +1058,7 @@ async def on_message(message: discord.Message):
             return
 
         await message.reply(
-            "I’m here. Mention me with **link**, **win**, **loss**, or **push**.",
+            "I’m here. Try `ping`, `show record`, `who is owner`, `set owner`, `link`, or `grade this a win/loss/push`.",
             mention_author=False
         )
 
