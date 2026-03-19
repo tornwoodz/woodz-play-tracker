@@ -92,6 +92,22 @@ TEAM_ALIASES = {
     "charlotte hornets": "Charlotte Hornets",
     "san antonio spurs": "San Antonio Spurs",
     "houston rockets": "Houston Rockets",
+    "miami (oh)": "Miami (OH)",
+    "prairie view a&m": "Prairie View A&M",
+    "tcu": "TCU",
+    "ohio state": "Ohio State",
+    "troy": "Troy",
+    "nebraska": "Nebraska",
+    "louisville": "Louisville",
+    "wisconsin": "Wisconsin",
+    "vanderbilt": "Vanderbilt",
+    "smu": "SMU",
+    "umbc": "UMBC",
+    "howard": "Howard",
+    "lehigh": "Lehigh",
+    "south florida": "South Florida",
+    "high point": "High Point",
+    "mcneese": "McNeese",
 }
 
 STAT_ALIASES = {
@@ -165,7 +181,6 @@ def load_data() -> dict:
 
 
 data = load_data()
-
 
 # =========================================================
 # HELPERS
@@ -290,11 +305,9 @@ def detect_result(text: str) -> Optional[str]:
 def should_trigger_link_builder(content: str) -> bool:
     text = (content or "").lower().strip()
 
-    # Must contain the word "link"
     if not re.search(r"\blink\b", text):
         return False
 
-    # Don't let grading / record phrases trigger it
     blocked_phrases = [
         "grade this",
         "cash this",
@@ -312,10 +325,7 @@ def should_trigger_link_builder(content: str) -> bool:
         "red this",
     ]
 
-    if any(phrase in text for phrase in blocked_phrases):
-        return False
-
-    return True
+    return not any(phrase in text for phrase in blocked_phrases)
 
 
 def get_best_member_role(member: discord.Member) -> str:
@@ -450,11 +460,20 @@ def smart_parse_legs(ocr_text: str):
         "hit rate",
         "nba parlay",
         "sgp stack",
-        "odds",
+        "odds boost",
         "woodzdabookie",
         "builders",
         "ovr",
         "psb",
+        "bonus bet",
+        "my bets",
+        "settled",
+        "open",
+        "saved",
+        "live",
+        "finished",
+        "thu",
+        "et",
     ]
 
     for raw_line in lines:
@@ -463,29 +482,15 @@ def smart_parse_legs(ocr_text: str):
 
         if any(bad in lowered for bad in ignore_contains):
             continue
-        if len(line) < 4:
+        if len(line) < 3:
             continue
         if re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", line):
             continue
-
-        spread_match = re.search(
-            r"^([A-Za-z][A-Za-z\s\.]+?)\s+([+-]\s*\d+(?:\.\d+)?)\s*$",
-            line,
-            re.IGNORECASE,
-        )
-        if spread_match:
-            team = normalize_team(spread_match.group(1))
-            spread = spread_match.group(2).replace(" ", "")
-            legs.append({
-                "type": "spread",
-                "team": team,
-                "line": spread,
-                "raw": raw_line,
-            })
+        if re.fullmatch(r"\$\d+(?:\.\d+)?", line):
             continue
 
         spread_period_match = re.search(
-            r"^([A-Za-z][A-Za-z\s\.]+?)\s+([+-]\s*\d+(?:\.\d+)?)\s+(1st Half|1st Quarter|2nd Half|2nd Quarter|3rd Quarter|4th Quarter)$",
+            r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\s*\d+(?:\.\d+)?)\s+(1st Half|1st Quarter|2nd Half|2nd Quarter|3rd Quarter|4th Quarter)$",
             line,
             re.IGNORECASE,
         )
@@ -498,6 +503,22 @@ def smart_parse_legs(ocr_text: str):
                 "team": team,
                 "line": spread,
                 "period": period,
+                "raw": raw_line,
+            })
+            continue
+
+        spread_match = re.search(
+            r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\s*\d+(?:\.\d+)?)\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if spread_match:
+            team = normalize_team(spread_match.group(1))
+            spread = spread_match.group(2).replace(" ", "")
+            legs.append({
+                "type": "spread",
+                "team": team,
+                "line": spread,
                 "raw": raw_line,
             })
             continue
@@ -541,7 +562,11 @@ def smart_parse_legs(ocr_text: str):
             })
             continue
 
-        ml_match = re.search(r"^([A-Za-z][A-Za-z\s\.]+?)\s+ML$", line, re.IGNORECASE)
+        ml_match = re.search(
+            r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+(ML|Moneyline)$",
+            line,
+            re.IGNORECASE,
+        )
         if ml_match:
             team = normalize_team(ml_match.group(1))
             legs.append({
@@ -551,7 +576,31 @@ def smart_parse_legs(ocr_text: str):
             })
             continue
 
-    return legs
+        total_match = re.search(
+            r"^(Over|Under)\s+(\d+(?:\.\d+)?)$",
+            line,
+            re.IGNORECASE,
+        )
+        if total_match:
+            direction = total_match.group(1).title()
+            line_val = total_match.group(2)
+            legs.append({
+                "type": "total",
+                "direction": direction,
+                "line": line_val,
+                "raw": raw_line,
+            })
+            continue
+
+    deduped = []
+    seen = set()
+    for leg in legs:
+        key = json.dumps(leg, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(leg)
+
+    return deduped
 
 
 def parse_betslip_meta(ocr_text: str) -> dict:
@@ -584,10 +633,7 @@ class SportsbookLinksView(discord.ui.View):
             if not url:
                 continue
             label = book.title()
-            if query:
-                target = f"{url}?q={quote_plus(query)}"
-            else:
-                target = url
+            target = f"{url}?q={quote_plus(query)}" if query else url
             self.add_item(discord.ui.Button(label=label, url=target))
 
 
@@ -602,7 +648,11 @@ async def extract_text_from_image_url(image_url: str) -> str:
     }
 
     async with aiohttp.ClientSession() as session:
-        async with session.post("https://api.ocr.space/parse/image", data=payload, timeout=45) as resp:
+        async with session.post(
+            "https://api.ocr.space/parse/image",
+            data=payload,
+            timeout=45
+        ) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"OCR request failed with status {resp.status}")
             data_resp = await resp.json(content_type=None)
@@ -638,7 +688,7 @@ async def build_link_this_response(message: discord.Message) -> tuple[discord.Em
     if not attachment:
         embed = discord.Embed(
             title="🔗 Pick Trax Betslip Builder",
-            description="I need a screenshot attachment or a reply to a screenshot to build the slip.",
+            description="I need a screenshot attached, or reply to a screenshot and say link.",
             color=discord.Color.red(),
         )
         return embed, None
@@ -674,7 +724,7 @@ async def build_link_this_response(message: discord.Message) -> tuple[discord.Em
         display_lines.append(f"**{idx}.** {leg_to_display(leg)}")
 
     embed.add_field(name="Parsed Legs", value="\n".join(display_lines)[:1024], inline=False)
-    embed.set_footer(text="Link buttons open supported sportsbooks. Best for clear screenshots.")
+    embed.set_footer(text="Reply to a screenshot with 'link' or mention the bot with 'link'.")
     return embed, SportsbookLinksView(legs)
 
 
@@ -837,7 +887,6 @@ def create_auto_pick_from_message(message: discord.Message, play_type: str) -> d
     save_data(data)
     return pick
 
-
 # =========================================================
 # DISCORD SETUP
 # =========================================================
@@ -845,6 +894,7 @@ def create_auto_pick_from_message(message: discord.Message, play_type: str) -> d
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -903,7 +953,6 @@ class GradeView(discord.ui.View):
     async def push_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.grade_pick(interaction, "push")
 
-
 # =========================================================
 # EVENTS
 # =========================================================
@@ -938,8 +987,11 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
-    # Link builder trigger
-    if message.guild and bot_mentioned and should_trigger_link_builder(content):
+    link_requested = should_trigger_link_builder(content)
+    image_context = await get_image_attachment_from_context(message)
+    has_image_context = image_context is not None
+
+    if message.guild and link_requested and (bot_mentioned or has_image_context):
         try:
             embed, view = await build_link_this_response(message)
             await message.reply(embed=embed, view=view, mention_author=False)
@@ -999,7 +1051,6 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-
 # =========================================================
 # ERROR HANDLER
 # =========================================================
@@ -1018,7 +1069,6 @@ async def on_app_command_error(
             await interaction.response.send_message(f"Error: {error}", ephemeral=True)
     except Exception as e:
         print(f"❌ Failed to send error message: {e}")
-
 
 # =========================================================
 # COMMANDS
@@ -1147,7 +1197,6 @@ async def channelid(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-
 # =========================================================
 # SETTINGS GROUP
 # =========================================================
@@ -1197,7 +1246,6 @@ async def settings_toggle_dollars(interaction: discord.Interaction, enabled: boo
 
 
 bot.tree.add_command(settings_group)
-
 
 # =========================================================
 # RUN
