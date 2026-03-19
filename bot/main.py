@@ -108,6 +108,7 @@ TEAM_ALIASES = {
     "south florida": "South Florida",
     "high point": "High Point",
     "mcneese": "McNeese",
+    "houston": "Houston Rockets",
 }
 
 STAT_ALIASES = {
@@ -122,6 +123,8 @@ STAT_ALIASES = {
     "reb": "Rebounds",
     "three pointers": "3PT Made",
     "threes": "3PT Made",
+    "3pt": "3PT Made",
+    "3pt made": "3PT Made",
     "pra": "PRA",
     "pa": "Points + Assists",
     "pr": "Points + Rebounds",
@@ -183,7 +186,7 @@ def load_data() -> dict:
 data = load_data()
 
 # =========================================================
-# HELPERS
+# GENERAL HELPERS
 # =========================================================
 
 def is_owner_user(user_id: int) -> bool:
@@ -290,11 +293,9 @@ def detect_result(text: str) -> Optional[str]:
     for phrase in win_phrases:
         if phrase in exact:
             return "win"
-
     for phrase in loss_phrases:
         if phrase in exact:
             return "loss"
-
     for phrase in push_phrases:
         if phrase in exact:
             return "push"
@@ -407,6 +408,9 @@ def build_record_embed() -> discord.Embed:
     embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
     return embed
 
+# =========================================================
+# IMAGE / OCR HELPERS
+# =========================================================
 
 def is_image_attachment(att: discord.Attachment) -> bool:
     ct = (att.content_type or "").lower()
@@ -421,9 +425,67 @@ def clean_ocr_text(text: str) -> str:
     text = text.replace("\r", "")
     text = text.replace("—", "-").replace("–", "-")
     text = text.replace("•", "• ")
+    text = text.replace("|", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def clean_ocr_lines(text: str) -> list[str]:
+    junk_contains = [
+        "must be 21",
+        "call 1-800-gambler",
+        "bet id",
+        "my bets",
+        "settled",
+        "open",
+        "saved",
+        "cash out",
+        "accept odds movements",
+        "enter wager amount",
+        "to win",
+        "wager",
+        "bonus bet",
+        "same game parlay",
+        "sgp",
+        "live",
+        "finished",
+        "thu",
+        "fri",
+        "sat",
+        "sun",
+        "et",
+        "professional sports bettor",
+        "hit rate",
+        "builders",
+        "ovr",
+        "psb",
+        "woodzdabookie",
+    ]
+
+    out = []
+    for raw in clean_ocr_text(text).split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+
+        lower = line.lower()
+
+        if any(j in lower for j in junk_contains):
+            continue
+
+        if re.fullmatch(r"\$?\d+(?:\.\d+)?", line):
+            continue
+
+        if re.fullmatch(r"[+-]\d{3,4}", line):
+            continue
+
+        if len(line) < 2:
+            continue
+
+        out.append(line)
+
+    return out
 
 
 def normalize_stat(raw: str) -> str:
@@ -436,162 +498,266 @@ def normalize_team(raw: str) -> str:
     return TEAM_ALIASES.get(lowered, cleaned.title())
 
 
+def normalize_player(raw: str) -> str:
+    cleaned = re.sub(r"\s+", " ", raw).strip(" .-")
+    return cleaned.title()
+
+
 def leg_to_display(leg: dict) -> str:
     if leg["type"] == "player_prop":
         direction = leg.get("direction", "Over")
+        comparator = leg.get("comparator", "")
+        if comparator == "+":
+            return f"{leg['player']} {leg['line']}+ {leg['stat']}"
         return f"{leg['player']} {direction} {leg['line']} {leg['stat']}"
+
     if leg["type"] == "spread":
         period = f" ({leg['period']})" if leg.get("period") else ""
         return f"{leg['team']} {leg['line']} Spread{period}"
+
     if leg["type"] == "moneyline":
         return f"{leg['team']} Moneyline"
+
+    if leg["type"] == "total":
+        matchup = f" — {leg['matchup']}" if leg.get("matchup") else ""
+        return f"{leg['direction']} {leg['line']} Total{matchup}"
+
     return leg.get("raw", "Unknown leg")
 
 
-def smart_parse_legs(ocr_text: str):
-    lines = [l.strip() for l in clean_ocr_text(ocr_text).split("\n") if l.strip()]
+def detect_sportsbook(ocr_text: str) -> str:
+    t = (ocr_text or "").lower()
+
+    if "bonus bet" in t or "same game parlay" in t or "accept odds movements" in t:
+        return "fanduel"
+    if "draftkings" in t:
+        return "draftkings"
+    if "betmgm" in t:
+        return "betmgm"
+    if "caesars" in t:
+        return "caesars"
+    if "fanatics" in t:
+        return "fanatics"
+    if "espnbet" in t or "espn bet" in t:
+        return "espnbet"
+    return "unknown"
+
+
+def looks_like_matchup(line: str) -> bool:
+    lower = line.lower()
+    return " v " in lower or " vs " in lower or " @ " in lower
+
+
+def group_lines_into_blocks(lines: list[str]) -> list[list[str]]:
+    blocks = []
+    current = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # new leg-ish line starts
+        starts_new = False
+
+        if re.search(r"^(over|under)\s+\d+(\.\d+)?$", stripped, re.IGNORECASE):
+            starts_new = True
+        elif re.search(r"^[a-z0-9&().' \-]+\s+(ml|moneyline)$", stripped, re.IGNORECASE):
+            starts_new = True
+        elif re.search(r"^[a-z0-9&().' \-]+\s+[+-]\d+(\.\d+)?$", stripped, re.IGNORECASE):
+            starts_new = True
+        elif re.search(r"^\d+(\.\d+)?\+\s+[a-z.'\- ]+\s*-\s*(points|assists|rebounds|pra|pa|pr|ar|pts|ast|reb)$", stripped, re.IGNORECASE):
+            starts_new = True
+        elif re.search(r"^[a-z.'\- ]+\s+(over|under)\s+\d+(\.\d+)?\s+(points|assists|rebounds|pra|pa|pr|ar|pts|ast|reb)$", stripped, re.IGNORECASE):
+            starts_new = True
+
+        if starts_new and current:
+            blocks.append(current)
+            current = [stripped]
+        else:
+            current.append(stripped)
+
+    if current:
+        blocks.append(current)
+
+    return blocks
+
+
+def parse_single_line_leg(line: str) -> Optional[dict]:
+    spread_period_match = re.search(
+        r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\d+(?:\.\d+)?)\s+(1st Half|1st Quarter|2nd Half|2nd Quarter|3rd Quarter|4th Quarter)$",
+        line,
+        re.IGNORECASE,
+    )
+    if spread_period_match:
+        return {
+            "type": "spread",
+            "team": normalize_team(spread_period_match.group(1)),
+            "line": spread_period_match.group(2),
+            "period": spread_period_match.group(3).title(),
+            "raw": line,
+        }
+
+    spread_match = re.search(
+        r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\d+(?:\.\d+)?)$",
+        line,
+        re.IGNORECASE,
+    )
+    if spread_match:
+        return {
+            "type": "spread",
+            "team": normalize_team(spread_match.group(1)),
+            "line": spread_match.group(2),
+            "raw": line,
+        }
+
+    ml_match = re.search(
+        r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+(ML|Moneyline)$",
+        line,
+        re.IGNORECASE,
+    )
+    if ml_match:
+        return {
+            "type": "moneyline",
+            "team": normalize_team(ml_match.group(1)),
+            "raw": line,
+        }
+
+    total_match = re.search(
+        r"^(Over|Under)\s+(\d+(?:\.\d+)?)$",
+        line,
+        re.IGNORECASE,
+    )
+    if total_match:
+        return {
+            "type": "total",
+            "direction": total_match.group(1).title(),
+            "line": total_match.group(2),
+            "raw": line,
+        }
+
+    player_plus_match = re.search(
+        r"^(\d+(?:\.\d+)?)\+\s+([A-Za-z\.'\-\s]+?)\s*-\s*(Points|Assists|Rebounds|PRA|PA|PR|AR|Pts|Ast|Reb)$",
+        line,
+        re.IGNORECASE,
+    )
+    if player_plus_match:
+        return {
+            "type": "player_prop",
+            "player": normalize_player(player_plus_match.group(2)),
+            "line": player_plus_match.group(1),
+            "comparator": "+",
+            "stat": normalize_stat(player_plus_match.group(3)),
+            "raw": line,
+        }
+
+    player_ou_match = re.search(
+        r"^([A-Za-z\.'\-\s]+?)\s+(Over|Under)\s+(\d+(?:\.\d+)?)\s+(Points|Assists|Rebounds|PRA|PA|PR|AR|Pts|Ast|Reb)$",
+        line,
+        re.IGNORECASE,
+    )
+    if player_ou_match:
+        return {
+            "type": "player_prop",
+            "player": normalize_player(player_ou_match.group(1)),
+            "direction": player_ou_match.group(2).title(),
+            "line": player_ou_match.group(3),
+            "stat": normalize_stat(player_ou_match.group(4)),
+            "raw": line,
+        }
+
+    return None
+
+
+def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
     legs = []
 
-    ignore_contains = [
-        "must be 21",
-        "call 1-800-gambler",
-        "bet id",
-        "professional sports bettor",
-        "hit rate",
-        "nba parlay",
-        "sgp stack",
-        "odds boost",
-        "woodzdabookie",
-        "builders",
-        "ovr",
-        "psb",
-        "bonus bet",
-        "my bets",
-        "settled",
-        "open",
-        "saved",
-        "live",
-        "finished",
-        "thu",
-        "et",
-    ]
+    for block in blocks:
+        text = " | ".join(block)
 
-    for raw_line in lines:
-        line = raw_line.replace("•", "").strip()
-        lowered = line.lower()
+        # direct single-line parse from any line
+        parsed = None
+        for line in block:
+            parsed = parse_single_line_leg(line)
+            if parsed:
+                break
 
-        if any(bad in lowered for bad in ignore_contains):
-            continue
-        if len(line) < 3:
-            continue
-        if re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", line):
-            continue
-        if re.fullmatch(r"\$\d+(?:\.\d+)?", line):
+        if parsed:
+            # attach matchup context for totals if nearby
+            if parsed["type"] == "total":
+                for b in block:
+                    if looks_like_matchup(b):
+                        parsed["matchup"] = b
+                        break
+            legs.append(parsed)
             continue
 
-        spread_period_match = re.search(
-            r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\s*\d+(?:\.\d+)?)\s+(1st Half|1st Quarter|2nd Half|2nd Quarter|3rd Quarter|4th Quarter)$",
-            line,
-            re.IGNORECASE,
-        )
-        if spread_period_match:
-            team = normalize_team(spread_period_match.group(1))
-            spread = spread_period_match.group(2).replace(" ", "")
-            period = spread_period_match.group(3).title()
-            legs.append({
-                "type": "spread",
-                "team": team,
-                "line": spread,
-                "period": period,
-                "raw": raw_line,
-            })
-            continue
+        # FanDuel stacked total:
+        # Over 140.5 / TOTAL POINTS / UMBC / Howard
+        if len(block) >= 2:
+            first = block[0]
+            second = block[1]
 
-        spread_match = re.search(
-            r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\s*\d+(?:\.\d+)?)\s*$",
-            line,
-            re.IGNORECASE,
-        )
-        if spread_match:
-            team = normalize_team(spread_match.group(1))
-            spread = spread_match.group(2).replace(" ", "")
-            legs.append({
-                "type": "spread",
-                "team": team,
-                "line": spread,
-                "raw": raw_line,
-            })
-            continue
+            m_total = re.search(r"^(Over|Under)\s+(\d+(?:\.\d+)?)$", first, re.IGNORECASE)
+            if m_total and ("total" in second.lower()):
+                leg = {
+                    "type": "total",
+                    "direction": m_total.group(1).title(),
+                    "line": m_total.group(2),
+                    "raw": text,
+                }
+                if len(block) >= 4:
+                    leg["matchup"] = f"{normalize_team(block[2])} vs {normalize_team(block[3])}"
+                legs.append(leg)
+                continue
 
-        player_plus_match = re.search(
-            r"^(\d+(?:\.\d+)?)\+\s+([A-Za-z\.'\-\s]+?)\s*-\s*(Points|Assists|Rebounds|PRA|PA|PR|AR|Pts|Ast|Reb)\s*$",
-            line,
-            re.IGNORECASE,
-        )
-        if player_plus_match:
-            line_val = player_plus_match.group(1)
-            player = re.sub(r"\s+", " ", player_plus_match.group(2)).strip(" .-")
-            stat = normalize_stat(player_plus_match.group(3))
-            legs.append({
-                "type": "player_prop",
-                "player": player,
-                "direction": "Over",
-                "line": line_val,
-                "stat": stat,
-                "raw": raw_line,
-            })
-            continue
-
-        player_ou_match = re.search(
-            r"^([A-Za-z\.'\-\s]+?)\s+(Over|Under)\s+(\d+(?:\.\d+)?)\s+(Points|Assists|Rebounds|PRA|PA|PR|AR|Pts|Ast|Reb)\s*$",
-            line,
-            re.IGNORECASE,
-        )
-        if player_ou_match:
-            player = re.sub(r"\s+", " ", player_ou_match.group(1)).strip(" .-")
-            direction = player_ou_match.group(2).title()
-            line_val = player_ou_match.group(3)
-            stat = normalize_stat(player_ou_match.group(4))
-            legs.append({
-                "type": "player_prop",
-                "player": player,
-                "direction": direction,
-                "line": line_val,
-                "stat": stat,
-                "raw": raw_line,
-            })
-            continue
-
-        ml_match = re.search(
-            r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+(ML|Moneyline)$",
-            line,
-            re.IGNORECASE,
-        )
-        if ml_match:
-            team = normalize_team(ml_match.group(1))
+        # FanDuel stacked moneyline:
+        # Prairie View A&M / MONEYLINE / Prairie View A&M / Lehigh
+        if len(block) >= 2 and block[1].lower() == "moneyline":
             legs.append({
                 "type": "moneyline",
-                "team": team,
-                "raw": raw_line,
+                "team": normalize_team(block[0]),
+                "raw": text,
             })
             continue
 
-        total_match = re.search(
-            r"^(Over|Under)\s+(\d+(?:\.\d+)?)$",
-            line,
+        # FanDuel stacked spread:
+        # Miami (OH) +13.5 / ALTERNATE SPREAD 2 / Miami (OH) / SMU
+        m_spread = re.search(
+            r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\d+(?:\.\d+)?)$",
+            block[0],
             re.IGNORECASE,
-        )
-        if total_match:
-            direction = total_match.group(1).title()
-            line_val = total_match.group(2)
+        ) if block else None
+        if m_spread and len(block) >= 2 and "spread" in block[1].lower():
             legs.append({
-                "type": "total",
-                "direction": direction,
-                "line": line_val,
-                "raw": raw_line,
+                "type": "spread",
+                "team": normalize_team(m_spread.group(1)),
+                "line": m_spread.group(2),
+                "raw": text,
             })
             continue
 
+        # 3-line player prop:
+        # Kevin Durant / 15+ / Points
+        if len(block) >= 3:
+            player_line = block[0]
+            line_line = block[1]
+            stat_line = block[2]
+
+            if re.search(r"^\d+(\.\d+)?\+$", line_line) and stat_line.lower() in {
+                "points", "assists", "rebounds", "pra", "pa", "pr", "ar", "pts", "ast", "reb"
+            }:
+                legs.append({
+                    "type": "player_prop",
+                    "player": normalize_player(player_line),
+                    "line": line_line.replace("+", ""),
+                    "comparator": "+",
+                    "stat": normalize_stat(stat_line),
+                    "raw": text,
+                })
+                continue
+
+    # dedupe
     deduped = []
     seen = set()
     for leg in legs:
@@ -603,24 +769,67 @@ def smart_parse_legs(ocr_text: str):
     return deduped
 
 
+def parse_fanduel_legs(ocr_text: str) -> list[dict]:
+    lines = clean_ocr_lines(ocr_text)
+    blocks = group_lines_into_blocks(lines)
+    return parse_grouped_blocks(blocks)
+
+
+def parse_generic_legs(ocr_text: str) -> list[dict]:
+    lines = clean_ocr_lines(ocr_text)
+    blocks = group_lines_into_blocks(lines)
+    return parse_grouped_blocks(blocks)
+
+
 def parse_betslip_meta(ocr_text: str) -> dict:
     cleaned = clean_ocr_text(ocr_text)
     odds = extract_odds_from_text(cleaned)
     leg_count = None
+
     m = re.search(r"(\d+)\s*LEG", cleaned, re.IGNORECASE)
     if m:
         try:
             leg_count = int(m.group(1))
         except Exception:
             leg_count = None
+
     return {"odds": odds, "leg_count": leg_count}
 
 
+def score_parse_confidence(book: str, legs: list[dict], meta: dict, ocr_text: str) -> tuple[int, str]:
+    score = 0
+
+    if book != "unknown":
+        score += 2
+    if meta.get("leg_count"):
+        score += 2
+    if meta.get("odds"):
+        score += 1
+
+    score += min(len(legs), 8)
+
+    leg_count = meta.get("leg_count")
+    if leg_count and legs:
+        diff = abs(leg_count - len(legs))
+        if diff == 0:
+            score += 3
+        elif diff == 1:
+            score += 1
+        else:
+            score -= min(diff, 3)
+
+    if len(clean_ocr_lines(ocr_text)) < 3:
+        score -= 2
+
+    if score >= 10:
+        return score, "high"
+    if score >= 6:
+        return score, "medium"
+    return score, "low"
+
+
 def build_book_search_query(legs: list[dict]) -> str:
-    pieces = []
-    for leg in legs[:8]:
-        pieces.append(leg_to_display(leg))
-    return " | ".join(pieces)
+    return " | ".join(leg_to_display(leg) for leg in legs[:8])
 
 
 class SportsbookLinksView(discord.ui.View):
@@ -632,9 +841,9 @@ class SportsbookLinksView(discord.ui.View):
             url = BOOK_URLS.get(book)
             if not url:
                 continue
-            label = book.title()
+
             target = f"{url}?q={quote_plus(query)}" if query else url
-            self.add_item(discord.ui.Button(label=label, url=target))
+            self.add_item(discord.ui.Button(label=book.title(), url=target))
 
 
 async def extract_text_from_image_url(image_url: str) -> str:
@@ -682,20 +891,30 @@ async def get_image_attachment_from_context(message: discord.Message) -> Optiona
 
     return None
 
+# =========================================================
+# LINK BUILDER RESPONSE
+# =========================================================
 
 async def build_link_this_response(message: discord.Message) -> tuple[discord.Embed, Optional[discord.ui.View]]:
     attachment = await get_image_attachment_from_context(message)
     if not attachment:
         embed = discord.Embed(
             title="🔗 Pick Trax Betslip Builder",
-            description="I need a screenshot attached, or reply to a screenshot and say link.",
+            description="Attach a screenshot, or reply to a screenshot and say `link`.",
             color=discord.Color.red(),
         )
         return embed, None
 
     ocr_text = await extract_text_from_image_url(attachment.url)
-    legs = smart_parse_legs(ocr_text)
+    book = detect_sportsbook(ocr_text)
     meta = parse_betslip_meta(ocr_text)
+
+    if book == "fanduel":
+        legs = parse_fanduel_legs(ocr_text)
+    else:
+        legs = parse_generic_legs(ocr_text)
+
+    confidence_score, confidence_label = score_parse_confidence(book, legs, meta, ocr_text)
 
     if not legs:
         preview = ocr_text[:900] if ocr_text else "No OCR text found."
@@ -704,29 +923,52 @@ async def build_link_this_response(message: discord.Message) -> tuple[discord.Em
             description="I read the screenshot, but I could not confidently parse the legs.",
             color=discord.Color.blue(),
         )
+        embed.add_field(name="Sportsbook", value=book.title(), inline=True)
+        embed.add_field(name="Confidence", value=f"{confidence_label.title()} ({confidence_score})", inline=True)
         embed.add_field(name="OCR Preview", value=preview[:1024], inline=False)
         return embed, None
 
+    color = discord.Color.green() if confidence_label == "high" else (
+        discord.Color.gold() if confidence_label == "medium" else discord.Color.blue()
+    )
+
+    found_text = f"Found **{len(legs)}** leg(s)"
+    if meta.get("leg_count"):
+        found_text += f" • OCR saw **{meta['leg_count']}**"
+
     embed = discord.Embed(
-        title="🔗 Pick Trax Betslip Builder",
-        description=f"Found **{len(legs)}** leg(s) from the screenshot.",
-        color=discord.Color.green(),
+        title="🔗 Pick Trax One-Click Builder",
+        description=found_text,
+        color=color,
         timestamp=datetime.now(timezone.utc),
     )
 
+    embed.add_field(name="Sportsbook", value=book.title(), inline=True)
+    embed.add_field(name="Confidence", value=f"{confidence_label.title()} ({confidence_score})", inline=True)
+
     if meta.get("odds"):
         embed.add_field(name="Slip Odds", value=f"{meta['odds']:+d}", inline=True)
-    if meta.get("leg_count"):
-        embed.add_field(name="OCR Leg Count", value=str(meta["leg_count"]), inline=True)
 
     display_lines = []
-    for idx, leg in enumerate(legs[:12], start=1):
+    for idx, leg in enumerate(legs[:10], start=1):
         display_lines.append(f"**{idx}.** {leg_to_display(leg)}")
 
     embed.add_field(name="Parsed Legs", value="\n".join(display_lines)[:1024], inline=False)
+
+    if confidence_label == "high":
+        quick_read = "Ready to shop across books."
+    elif confidence_label == "medium":
+        quick_read = "Looks solid. Double-check one or two legs before placing."
+    else:
+        quick_read = "Partial read. A tighter screenshot will help."
+    embed.add_field(name="Quick Read", value=quick_read, inline=False)
+
     embed.set_footer(text="Reply to a screenshot with 'link' or mention the bot with 'link'.")
     return embed, SportsbookLinksView(legs)
 
+# =========================================================
+# PICK TRACKING / RECAP HELPERS
+# =========================================================
 
 async def post_recap_if_configured(guild: discord.Guild) -> None:
     recap_channel = guild.get_channel(DAILY_RECAP_ID)
