@@ -1,1300 +1,32 @@
 import os
 import re
-import io
 import json
-import aiohttp
-import discord
+import asyncio
 from datetime import datetime, timezone
-from typing import Optional
-from urllib.parse import quote_plus
-from discord.ext import commands
-from discord import app_commands
-from PIL import Image, ImageDraw, ImageFont
+from typing import Optional, Dict, Any
 
-DATA_FILE = "picktrax_data.json"
+import discord
+from discord.ext import commands
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-GENERAL_CHAT_ID = 1483436461423333376
-VIP_GENERAL_CHAT_ID = 1483435285231702137
-POST_YOUR_WINS_ID = 1483439779390427341
-DAILY_RECAP_ID = 1483927105992392865
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-HAMMERS_CHANNEL_ID = 1483485837810335744
-PARLAYS_CHANNEL_ID = 1483433966227947619
-WEEKLY_LOCKS_CHANNEL_ID = 1483436117536542882
-LIVE_BETS_CHANNEL_ID = 1483435130235260928
-
-TRACKED_PICK_CHANNELS = {
-    HAMMERS_CHANNEL_ID: "hammer",
-    PARLAYS_CHANNEL_ID: "parlay",
-    WEEKLY_LOCKS_CHANNEL_ID: "weekly",
-    LIVE_BETS_CHANNEL_ID: "live",
+# Optional: if you want to limit actions to certain channels, add IDs here
+ALLOWED_CHANNEL_IDS = {
+    1483485837810335744,  # hammers-aka-singles
+    1483433966227947619,  # parlays
+    1483436117536542882,  # weekly-locks
+    1483435130235260928,  # live-bets
+    1483439779390427341,  # post-your-wins
+    1483927105992392865,  # daily-recap
+    1483435285231702137,  # vip-general-chat
+    1483436461423333376,  # general-chat
 }
 
-WIN_SUBMISSION_CHANNELS = {
-    GENERAL_CHAT_ID,
-    VIP_GENERAL_CHAT_ID,
-}
-
-VIP_ROLE_NAME = "🏆VIP"
-PUB_ROLE_NAME = "🆓PUB"
-
-OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
-SUPPORTED_BOOKS = [
-    b.strip().lower()
-    for b in os.getenv(
-        "SUPPORTED_BOOKS",
-        "fanduel,draftkings,betmgm,caesars,espnbet,fanatics"
-    ).split(",")
-    if b.strip()
-]
-
-BOOK_URLS = {
-    "fanduel": "https://sportsbook.fanduel.com/",
-    "draftkings": "https://sportsbook.draftkings.com/",
-    "betmgm": "https://sports.betmgm.com/",
-    "caesars": "https://www.caesars.com/sportsbook-and-casino",
-    "espnbet": "https://espnbet.com/",
-    "fanatics": "https://sportsbook.fanatics.com/",
-    "hardrockbet": "https://app.hardrock.bet/",
-    "bet365": "https://www.bet365.com/",
-}
-
-TEAM_ALIASES = {
-    "oklahoma city thunder": "Oklahoma City Thunder",
-    "brooklyn nets": "Brooklyn Nets",
-    "boston celtics": "Boston Celtics",
-    "golden state warriors": "Golden State Warriors",
-    "new york knicks": "New York Knicks",
-    "los angeles lakers": "Los Angeles Lakers",
-    "denver nuggets": "Denver Nuggets",
-    "phoenix suns": "Phoenix Suns",
-    "milwaukee bucks": "Milwaukee Bucks",
-    "miami heat": "Miami Heat",
-    "cleveland cavaliers": "Cleveland Cavaliers",
-    "indiana pacers": "Indiana Pacers",
-    "los angeles clippers": "Los Angeles Clippers",
-    "new orleans pelicans": "New Orleans Pelicans",
-    "portland trail blazers": "Portland Trail Blazers",
-    "dallas mavericks": "Dallas Mavericks",
-    "memphis grizzlies": "Memphis Grizzlies",
-    "minnesota timberwolves": "Minnesota Timberwolves",
-    "orlando magic": "Orlando Magic",
-    "philadelphia 76ers": "Philadelphia 76ers",
-    "sacramento kings": "Sacramento Kings",
-    "toronto raptors": "Toronto Raptors",
-    "atlanta hawks": "Atlanta Hawks",
-    "detroit pistons": "Detroit Pistons",
-    "chicago bulls": "Chicago Bulls",
-    "utah jazz": "Utah Jazz",
-    "washington wizards": "Washington Wizards",
-    "charlotte hornets": "Charlotte Hornets",
-    "san antonio spurs": "San Antonio Spurs",
-    "houston rockets": "Houston Rockets",
-    "miami (oh)": "Miami (OH)",
-    "prairie view a&m": "Prairie View A&M",
-    "tcu": "TCU",
-    "ohio state": "Ohio State",
-    "troy": "Troy",
-    "nebraska": "Nebraska",
-    "louisville": "Louisville",
-    "wisconsin": "Wisconsin",
-    "vanderbilt": "Vanderbilt",
-    "smu": "SMU",
-    "umbc": "UMBC",
-    "howard": "Howard",
-    "lehigh": "Lehigh",
-    "south florida": "South Florida",
-    "high point": "High Point",
-    "mcneese": "McNeese",
-    "houston": "Houston Rockets",
-}
-
-STAT_ALIASES = {
-    "points": "Points",
-    "point": "Points",
-    "pts": "Points",
-    "assists": "Assists",
-    "assist": "Assists",
-    "ast": "Assists",
-    "rebounds": "Rebounds",
-    "rebound": "Rebounds",
-    "reb": "Rebounds",
-    "three pointers": "3PT Made",
-    "threes": "3PT Made",
-    "3pt": "3PT Made",
-    "3pt made": "3PT Made",
-    "pra": "PRA",
-    "pa": "Points + Assists",
-    "pr": "Points + Rebounds",
-    "ar": "Assists + Rebounds",
-}
-
-# =========================================================
-# STORAGE
-# =========================================================
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def default_data() -> dict:
-    return {
-        "owner_id": None,
-        "show_dollars": False,
-        "unit_value": 100.0,
-        "record": {
-            "wins": 0,
-            "losses": 0,
-            "pushes": 0,
-            "units": 0.0,
-        },
-        "picks": [],
-        "graded_history": [],
-        "message_pick_map": {},
-        "registered_source_messages": [],
-    }
-
-
-def save_data(data: dict) -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-def load_data() -> dict:
-    if not os.path.exists(DATA_FILE):
-        data = default_data()
-        save_data(data)
-        return data
-
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = default_data()
-        save_data(data)
-
-    defaults = default_data()
-    for key, value in defaults.items():
-        if key not in data:
-            data[key] = value
-
-    return data
-
-
-data = load_data()
-
-# =========================================================
-# GENERAL HELPERS
-# =========================================================
-
-def is_owner_user(user_id: int) -> bool:
-    owner_id = data.get("owner_id")
-    return owner_id is not None and user_id == owner_id
-
-
-def format_profit(units: float) -> str:
-    if data["show_dollars"]:
-        dollars = units * float(data["unit_value"])
-        sign = "+" if dollars >= 0 else ""
-        return f"{sign}${dollars:,.2f}"
-    sign = "+" if units >= 0 else ""
-    return f"{sign}{units:.2f}U"
-
-
-def extract_units_from_text(text: str) -> float:
-    if not text:
-        return 1.0
-
-    lowered = text.lower()
-    patterns = [
-        r"([+-]?\d+(?:\.\d+)?)\s*u\b",
-        r"([+-]?\d+(?:\.\d+)?)\s*unit\b",
-        r"([+-]?\d+(?:\.\d+)?)\s*units\b",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, lowered)
-        if match:
-            try:
-                return abs(float(match.group(1)))
-            except Exception:
-                pass
-
-    return 1.0
-
-
-def extract_odds_from_text(text: str) -> int:
-    if not text:
-        return -110
-
-    match = re.search(r"(?<!\d)([+-]\d{3,4})(?!\d)", text)
-    if match:
-        try:
-            return int(match.group(1))
-        except Exception:
-            pass
-
-    return -110
-
-
-def detect_result(text: str) -> Optional[str]:
-    exact = text.strip().lower()
-
-    if exact in {"win", "w", "cash", "cashed", "hit", "winner", "won", "green"}:
-        return "win"
-    if exact in {"loss", "l", "lost", "miss", "missed", "red"}:
-        return "loss"
-    if exact in {"push", "p"}:
-        return "push"
-
-    win_phrases = [
-        "as a win",
-        "grade win",
-        "mark win",
-        "this hit",
-        "cash it",
-        "cash this",
-        "this won",
-        "i won",
-        "winner",
-        "won this",
-        "green this",
-        "graded win",
-        "we hit",
-        "it hit",
-        "banged",
-        "banged this",
-        "cashed this",
-        "this cashed",
-        "winner @",
-    ]
-    loss_phrases = [
-        "as a loss",
-        "grade loss",
-        "mark loss",
-        "it lost",
-        "missed",
-        "this lost",
-        "graded loss",
-        "this missed",
-        "it missed",
-        "red this",
-    ]
-    push_phrases = [
-        "as a push",
-        "grade push",
-        "mark push",
-        "this pushed",
-        "graded push",
-    ]
-
-    for phrase in win_phrases:
-        if phrase in exact:
-            return "win"
-    for phrase in loss_phrases:
-        if phrase in exact:
-            return "loss"
-    for phrase in push_phrases:
-        if phrase in exact:
-            return "push"
-
-    return None
-
-
-def should_trigger_link_builder(content: str) -> bool:
-    text = (content or "").lower().strip()
-
-    if not re.search(r"\blink\b", text):
-        return False
-
-    blocked_phrases = [
-        "grade this",
-        "cash this",
-        "mark win",
-        "mark loss",
-        "mark push",
-        "grade win",
-        "grade loss",
-        "grade push",
-        "this hit",
-        "this lost",
-        "this pushed",
-        "won this",
-        "green this",
-        "red this",
-    ]
-
-    return not any(phrase in text for phrase in blocked_phrases)
-
-
-def get_best_member_role(member: discord.Member) -> str:
-    role_names = {role.name for role in member.roles}
-
-    if VIP_ROLE_NAME in role_names:
-        return VIP_ROLE_NAME
-    if PUB_ROLE_NAME in role_names:
-        return PUB_ROLE_NAME
-
-    custom_roles = [role for role in member.roles if role.name != "@everyone"]
-    if custom_roles:
-        top_role = max(custom_roles, key=lambda r: r.position)
-        return top_role.name
-
-    return "Member"
-
-
-def find_pick_by_id(pick_id: int) -> Optional[dict]:
-    combined = list(data.get("picks", [])) + list(data.get("graded_history", []))
-    for pick in combined:
-        if pick["id"] == pick_id:
-            return pick
-    return None
-
-
-def pending_picks() -> list:
-    return [p for p in data["picks"] if p["status"] == "pending"]
-
-
-def graded_history() -> list:
-    return data["graded_history"]
-
-
-def build_pick_embed(pick: dict) -> discord.Embed:
-    color = discord.Color.blurple()
-    if pick["status"] == "win":
-        color = discord.Color.green()
-    elif pick["status"] == "loss":
-        color = discord.Color.red()
-    elif pick["status"] == "push":
-        color = discord.Color.light_grey()
-
-    embed = discord.Embed(
-        title=f"Pick #{pick['id']} • {pick['play_type'].title()}",
-        description=pick["bet"][:4000] if pick.get("bet") else "No description",
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="Units", value=f"{pick['units']:.2f}U", inline=True)
-    embed.add_field(name="Odds", value=f"{pick['odds']:+d}", inline=True)
-    embed.add_field(name="Status", value=pick["status"].upper(), inline=True)
-
-    if pick["status"] != "pending":
-        embed.add_field(
-            name="Profit",
-            value=format_profit(float(pick.get("profit_units", 0.0))),
-            inline=False,
-        )
-
-    if pick.get("source_channel_name"):
-        embed.add_field(name="Source Channel", value=pick["source_channel_name"], inline=False)
-
-    return embed
-
-
-def build_record_embed() -> discord.Embed:
-    rec = data["record"]
-    graded_decisions = rec["wins"] + rec["losses"]
-    win_rate = (rec["wins"] / graded_decisions * 100) if graded_decisions > 0 else 0.0
-
-    embed = discord.Embed(
-        title="📊 Official Record",
-        color=discord.Color.green(),
-    )
-    embed.add_field(name="Wins", value=str(rec["wins"]), inline=True)
-    embed.add_field(name="Losses", value=str(rec["losses"]), inline=True)
-    embed.add_field(name="Pushes", value=str(rec["pushes"]), inline=True)
-    embed.add_field(name="Profit", value=format_profit(rec["units"]), inline=True)
-    embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
-    return embed
-
-# =========================================================
-# IMAGE / OCR HELPERS
-# =========================================================
-
-def is_image_attachment(att: discord.Attachment) -> bool:
-    ct = (att.content_type or "").lower()
-    name = (att.filename or "").lower()
-    return ct.startswith("image/") or name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))
-
-
-def clean_ocr_text(text: str) -> str:
-    if not text:
-        return ""
-
-    text = text.replace("\r", "")
-    text = text.replace("—", "-").replace("–", "-")
-    text = text.replace("•", "• ")
-    text = text.replace("|", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def clean_ocr_lines(text: str) -> list[str]:
-    junk_contains = [
-        "must be 21",
-        "call 1-800-gambler",
-        "bet id",
-        "my bets",
-        "settled",
-        "open",
-        "saved",
-        "cash out",
-        "accept odds movements",
-        "enter wager amount",
-        "to win",
-        "wager",
-        "bonus bet",
-        "same game parlay",
-        "sgp",
-        "professional sports bettor",
-        "hit rate",
-        "builders",
-        "ovr",
-        "psb",
-        "woodzdabookie",
-    ]
-
-    out = []
-    for raw in clean_ocr_text(text).split("\n"):
-        line = raw.strip()
-        if not line:
-            continue
-
-        lower = line.lower()
-
-        if any(j in lower for j in junk_contains):
-            continue
-
-        if re.fullmatch(r"\$?\d+(?:\.\d+)?", line):
-            continue
-
-        if re.fullmatch(r"[+-]\d{3,4}", line):
-            continue
-
-        if len(line) < 2:
-            continue
-
-        out.append(line)
-
-    return out
-
-
-def normalize_stat(raw: str) -> str:
-    return STAT_ALIASES.get(raw.strip().lower(), raw.strip().title())
-
-
-def normalize_team(raw: str) -> str:
-    cleaned = re.sub(r"\s+", " ", raw).strip(" -")
-    lowered = cleaned.lower()
-    return TEAM_ALIASES.get(lowered, cleaned.title())
-
-
-def normalize_player(raw: str) -> str:
-    cleaned = re.sub(r"\s+", " ", raw).strip(" .-")
-    return cleaned.title()
-
-
-def leg_to_display(leg: dict) -> str:
-    if leg["type"] == "player_prop":
-        direction = leg.get("direction", "Over")
-        comparator = leg.get("comparator", "")
-        if comparator == "+":
-            return f"{leg['player']} {leg['line']}+ {leg['stat']}"
-        return f"{leg['player']} {direction} {leg['line']} {leg['stat']}"
-
-    if leg["type"] == "spread":
-        period = f" ({leg['period']})" if leg.get("period") else ""
-        return f"{leg['team']} {leg['line']} Spread{period}"
-
-    if leg["type"] == "moneyline":
-        return f"{leg['team']} Moneyline"
-
-    if leg["type"] == "total":
-        matchup = f" — {leg['matchup']}" if leg.get("matchup") else ""
-        return f"{leg['direction']} {leg['line']} Total{matchup}"
-
-    return leg.get("raw", "Unknown leg")
-
-
-def detect_sportsbook(ocr_text: str) -> str:
-    t = (ocr_text or "").lower()
-
-    if "bonus bet" in t or "same game parlay" in t or "accept odds movements" in t:
-        return "fanduel"
-    if "draftkings" in t:
-        return "draftkings"
-    if "betmgm" in t:
-        return "betmgm"
-    if "caesars" in t:
-        return "caesars"
-    if "fanatics" in t:
-        return "fanatics"
-    if "espnbet" in t or "espn bet" in t:
-        return "espnbet"
-    return "unknown"
-
-
-def looks_like_matchup(line: str) -> bool:
-    lower = line.lower()
-    return " v " in lower or " vs " in lower or " @ " in lower
-
-
-def is_schedule_or_status_line(line: str) -> bool:
-    lower = line.lower().strip()
-
-    if re.search(r"\b(mon|tue|wed|thu|fri|sat|sun)\b", lower):
-        return True
-    if re.search(r"\b\d{1,2}:\d{2}\s*(am|pm)\b", lower):
-        return True
-    if lower.endswith(" et") or lower == "et":
-        return True
-    if "live" == lower or "finished" == lower:
-        return True
-    return False
-
-
-def group_lines_into_blocks(lines: list[str]) -> list[list[str]]:
-    blocks = []
-    current = []
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-
-        starts_new = False
-
-        if re.search(r"^(over|under)\s+\d+(\.\d+)?$", stripped, re.IGNORECASE):
-            starts_new = True
-        elif re.search(r"^[a-z0-9&().' \-]+\s+(ml|moneyline)$", stripped, re.IGNORECASE):
-            starts_new = True
-        elif re.search(r"^[a-z0-9&().' \-]+\s+[+-]\d+(\.\d+)?$", stripped, re.IGNORECASE):
-            starts_new = True
-        elif re.search(r"^\d+(\.\d+)?\+\s+[a-z.'\- ]+\s*-\s*(points|assists|rebounds|pra|pa|pr|ar|pts|ast|reb)$", stripped, re.IGNORECASE):
-            starts_new = True
-        elif re.search(r"^[a-z.'\- ]+\s+(over|under)\s+\d+(\.\d+)?\s+(points|assists|rebounds|pra|pa|pr|ar|pts|ast|reb)$", stripped, re.IGNORECASE):
-            starts_new = True
-
-        if starts_new and current:
-            blocks.append(current)
-            current = [stripped]
-        else:
-            current.append(stripped)
-
-    if current:
-        blocks.append(current)
-
-    return blocks
-
-
-def parse_single_line_leg(line: str) -> Optional[dict]:
-    spread_period_match = re.search(
-        r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\d+(?:\.\d+)?)\s+(1st Half|1st Quarter|2nd Half|2nd Quarter|3rd Quarter|4th Quarter)$",
-        line,
-        re.IGNORECASE,
-    )
-    if spread_period_match:
-        return {
-            "type": "spread",
-            "team": normalize_team(spread_period_match.group(1)),
-            "line": spread_period_match.group(2),
-            "period": spread_period_match.group(3).title(),
-            "raw": line,
-        }
-
-    spread_match = re.search(
-        r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\d+(?:\.\d+)?)$",
-        line,
-        re.IGNORECASE,
-    )
-    if spread_match:
-        return {
-            "type": "spread",
-            "team": normalize_team(spread_match.group(1)),
-            "line": spread_match.group(2),
-            "raw": line,
-        }
-
-    ml_match = re.search(
-        r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+(ML|Moneyline)$",
-        line,
-        re.IGNORECASE,
-    )
-    if ml_match:
-        return {
-            "type": "moneyline",
-            "team": normalize_team(ml_match.group(1)),
-            "raw": line,
-        }
-
-    total_match = re.search(
-        r"^(Over|Under)\s+(\d+(?:\.\d+)?)$",
-        line,
-        re.IGNORECASE,
-    )
-    if total_match:
-        return {
-            "type": "total",
-            "direction": total_match.group(1).title(),
-            "line": total_match.group(2),
-            "raw": line,
-        }
-
-    player_plus_match = re.search(
-        r"^(\d+(?:\.\d+)?)\+\s+([A-Za-z\.'\-\s]+?)\s*-\s*(Points|Assists|Rebounds|PRA|PA|PR|AR|Pts|Ast|Reb)$",
-        line,
-        re.IGNORECASE,
-    )
-    if player_plus_match:
-        return {
-            "type": "player_prop",
-            "player": normalize_player(player_plus_match.group(2)),
-            "line": player_plus_match.group(1),
-            "comparator": "+",
-            "stat": normalize_stat(player_plus_match.group(3)),
-            "raw": line,
-        }
-
-    player_ou_match = re.search(
-        r"^([A-Za-z\.'\-\s]+?)\s+(Over|Under)\s+(\d+(?:\.\d+)?)\s+(Points|Assists|Rebounds|PRA|PA|PR|AR|Pts|Ast|Reb)$",
-        line,
-        re.IGNORECASE,
-    )
-    if player_ou_match:
-        return {
-            "type": "player_prop",
-            "player": normalize_player(player_ou_match.group(1)),
-            "direction": player_ou_match.group(2).title(),
-            "line": player_ou_match.group(3),
-            "stat": normalize_stat(player_ou_match.group(4)),
-            "raw": line,
-        }
-
-    return None
-
-
-def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
-    legs = []
-
-    for block in blocks:
-        filtered_block = [line for line in block if not is_schedule_or_status_line(line)]
-        if not filtered_block:
-            continue
-
-        text = " | ".join(filtered_block)
-
-        parsed = None
-        for line in filtered_block:
-            parsed = parse_single_line_leg(line)
-            if parsed:
-                break
-
-        if parsed:
-            if parsed["type"] == "total":
-                for b in filtered_block:
-                    if looks_like_matchup(b):
-                        parsed["matchup"] = b
-                        break
-            legs.append(parsed)
-            continue
-
-        if len(filtered_block) >= 2:
-            first = filtered_block[0]
-            second = filtered_block[1]
-
-            m_total = re.search(r"^(Over|Under)\s+(\d+(?:\.\d+)?)$", first, re.IGNORECASE)
-            if m_total and ("total" in second.lower()):
-                leg = {
-                    "type": "total",
-                    "direction": m_total.group(1).title(),
-                    "line": m_total.group(2),
-                    "raw": text,
-                }
-                matchup_lines = [x for x in filtered_block[2:] if not is_schedule_or_status_line(x)]
-                if len(matchup_lines) >= 2:
-                    leg["matchup"] = f"{normalize_team(matchup_lines[0])} vs {normalize_team(matchup_lines[1])}"
-                legs.append(leg)
-                continue
-
-        if len(filtered_block) >= 2 and filtered_block[1].lower() == "moneyline":
-            legs.append({
-                "type": "moneyline",
-                "team": normalize_team(filtered_block[0]),
-                "raw": text,
-            })
-            continue
-
-        m_spread = re.search(
-            r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\d+(?:\.\d+)?)$",
-            filtered_block[0],
-            re.IGNORECASE,
-        ) if filtered_block else None
-        if m_spread and len(filtered_block) >= 2 and "spread" in filtered_block[1].lower():
-            legs.append({
-                "type": "spread",
-                "team": normalize_team(m_spread.group(1)),
-                "line": m_spread.group(2),
-                "raw": text,
-            })
-            continue
-
-        if len(filtered_block) >= 3:
-            player_line = filtered_block[0]
-            line_line = filtered_block[1]
-            stat_line = filtered_block[2]
-
-            if re.search(r"^\d+(\.\d+)?\+$", line_line) and stat_line.lower() in {
-                "points", "assists", "rebounds", "pra", "pa", "pr", "ar", "pts", "ast", "reb"
-            }:
-                legs.append({
-                    "type": "player_prop",
-                    "player": normalize_player(player_line),
-                    "line": line_line.replace("+", ""),
-                    "comparator": "+",
-                    "stat": normalize_stat(stat_line),
-                    "raw": text,
-                })
-                continue
-
-    deduped = []
-    seen = set()
-    for leg in legs:
-        key = json.dumps(leg, sort_keys=True)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(leg)
-
-    return deduped
-
-
-def parse_fanduel_legs(ocr_text: str) -> list[dict]:
-    lines = clean_ocr_lines(ocr_text)
-    blocks = group_lines_into_blocks(lines)
-    return parse_grouped_blocks(blocks)
-
-
-def parse_generic_legs(ocr_text: str) -> list[dict]:
-    lines = clean_ocr_lines(ocr_text)
-    blocks = group_lines_into_blocks(lines)
-    return parse_grouped_blocks(blocks)
-
-
-def parse_betslip_meta(ocr_text: str) -> dict:
-    cleaned = clean_ocr_text(ocr_text)
-    odds = extract_odds_from_text(cleaned)
-    leg_count = None
-
-    m = re.search(r"(\d+)\s*LEG", cleaned, re.IGNORECASE)
-    if m:
-        try:
-            leg_count = int(m.group(1))
-        except Exception:
-            leg_count = None
-
-    return {"odds": odds, "leg_count": leg_count}
-
-
-def score_parse_confidence(book: str, legs: list[dict], meta: dict, ocr_text: str) -> tuple[int, str]:
-    score = 0
-
-    if book != "unknown":
-        score += 2
-    if meta.get("leg_count"):
-        score += 2
-    if meta.get("odds"):
-        score += 1
-
-    score += min(len(legs), 8)
-
-    leg_count = meta.get("leg_count")
-    if leg_count and legs:
-        diff = abs(leg_count - len(legs))
-        if diff == 0:
-            score += 3
-        elif diff == 1:
-            score += 1
-        else:
-            score -= min(diff, 3)
-
-    if len(clean_ocr_lines(ocr_text)) < 3:
-        score -= 2
-
-    if score >= 10:
-        return score, "high"
-    if score >= 6:
-        return score, "medium"
-    return score, "low"
-
-
-def build_book_search_query(legs: list[dict]) -> str:
-    return " | ".join(leg_to_display(leg) for leg in legs[:8])
-
-
-class SportsbookLinksView(discord.ui.View):
-    def __init__(self, legs: list[dict]):
-        super().__init__(timeout=600)
-        query = build_book_search_query(legs)
-
-        for book in SUPPORTED_BOOKS[:5]:
-            url = BOOK_URLS.get(book)
-            if not url:
-                continue
-
-            target = f"{url}?q={quote_plus(query)}" if query else url
-            self.add_item(discord.ui.Button(label=book.title(), url=target))
-
-
-async def extract_text_from_image_url(image_url: str) -> str:
-    payload = {
-        "apikey": OCR_SPACE_API_KEY,
-        "url": image_url,
-        "language": "eng",
-        "isOverlayRequired": False,
-        "scale": True,
-        "OCREngine": 2,
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://api.ocr.space/parse/image",
-            data=payload,
-            timeout=45
-        ) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"OCR request failed with status {resp.status}")
-            data_resp = await resp.json(content_type=None)
-
-    if data_resp.get("IsErroredOnProcessing"):
-        msg = "; ".join(data_resp.get("ErrorMessage", []) or ["OCR processing failed"])
-        raise RuntimeError(msg)
-
-    results = data_resp.get("ParsedResults") or []
-    text = "\n".join((r.get("ParsedText") or "") for r in results)
-    return clean_ocr_text(text)
-
-
-async def get_image_attachment_from_context(message: discord.Message) -> Optional[discord.Attachment]:
-    for att in message.attachments:
-        if is_image_attachment(att):
-            return att
-
-    if message.reference and message.reference.message_id:
-        try:
-            referenced = await message.channel.fetch_message(message.reference.message_id)
-            for att in referenced.attachments:
-                if is_image_attachment(att):
-                    return att
-        except Exception:
-            return None
-
-    return None
-
-# =========================================================
-# VISUAL CARD RENDERING
-# =========================================================
-
-def safe_font(size: int, bold: bool = False):
-    candidates = []
-    if bold:
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-            "/Library/Fonts/Arial Bold.ttf",
-            "C:/Windows/Fonts/arialbd.ttf",
-        ]
-    else:
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-            "/Library/Fonts/Arial.ttf",
-            "C:/Windows/Fonts/arial.ttf",
-        ]
-
-    for path in candidates:
-        try:
-            return ImageFont.truetype(path, size=size)
-        except Exception:
-            continue
-
-    return ImageFont.load_default()
-
-
-def draw_wrapped_text(draw, text, font, fill, x, y, max_width, line_spacing=6):
-    words = text.split()
-    lines = []
-    current = ""
-
-    for word in words:
-        test = word if not current else f"{current} {word}"
-        bbox = draw.textbbox((0, 0), test, font=font)
-        width = bbox[2] - bbox[0]
-        if width <= max_width:
-            current = test
-        else:
-            if current:
-                lines.append(current)
-            current = word
-
-    if current:
-        lines.append(current)
-
-    for line in lines:
-        draw.text((x, y), line, font=font, fill=fill)
-        bbox = draw.textbbox((0, 0), line, font=font)
-        y += (bbox[3] - bbox[1]) + line_spacing
-
-    return y
-
-
-def create_picktrax_card_bytes(
-    legs: list[dict],
-    book: str,
-    confidence_label: str,
-    confidence_score: int,
-    odds: Optional[int] = None,
-    leg_count: Optional[int] = None,
-) -> io.BytesIO:
-    max_legs = min(len(legs), 6)
-    width = 1400
-    row_height = 122
-    header_h = 180
-    footer_h = 95
-    height = header_h + (row_height * max_legs) + footer_h
-
-    img = Image.new("RGB", (width, height), (9, 13, 22))
-    draw = ImageDraw.Draw(img)
-
-    outer_pad = 28
-    draw.rounded_rectangle(
-        (outer_pad, outer_pad, width - outer_pad, height - outer_pad),
-        radius=34,
-        fill=(17, 25, 39),
-    )
-
-    draw.rounded_rectangle(
-        (55, 55, width - 55, 155),
-        radius=26,
-        fill=(17, 91, 196),
-    )
-
-    title_font = safe_font(50, bold=True)
-    sub_font = safe_font(26, bold=False)
-    chip_font = safe_font(22, bold=True)
-    row_main_font = safe_font(34, bold=True)
-    row_sub_font = safe_font(22, bold=False)
-    footer_font = safe_font(24, bold=False)
-
-    draw.text((85, 78), "Pick Trax - One Click Betslip", font=title_font, fill=(255, 255, 255))
-
-    subtitle = f"{book.title()} • {confidence_label.title()} Confidence ({confidence_score})"
-    if odds:
-        subtitle += f" • {odds:+d}"
-    draw.text((87, 124), subtitle, font=sub_font, fill=(225, 238, 255))
-
-    chip_text = f"{max_legs}/{leg_count if leg_count else max_legs} Bets Found"
-    chip_bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
-    chip_w = chip_bbox[2] - chip_bbox[0]
-    chip_x1 = width - chip_w - 130
-    chip_x2 = width - 85
-    draw.rounded_rectangle((chip_x1, 92, chip_x2, 134), radius=16, fill=(11, 28, 50))
-    draw.text((chip_x1 + 16, 101), chip_text, font=chip_font, fill=(255, 255, 255))
-
-    start_y = 185
-    for idx, leg in enumerate(legs[:max_legs], start=1):
-        y1 = start_y + ((idx - 1) * row_height)
-        y2 = y1 + 92
-
-        row_fill = (18, 61, 119) if idx % 2 else (15, 48, 95)
-        draw.rounded_rectangle((75, y1, width - 75, y2), radius=20, fill=row_fill)
-
-        draw.rounded_rectangle((95, y1 + 21, 145, y1 + 67), radius=13, fill=(8, 24, 43))
-        draw.text((114, y1 + 28), str(idx), font=row_sub_font, fill=(255, 255, 255))
-
-        primary = leg_to_display(leg)
-        secondary = {
-            "moneyline": "Moneyline",
-            "spread": "Spread",
-            "player_prop": "Player Prop",
-            "total": "Game Total",
-        }.get(leg.get("type", ""), "")
-
-        text_x = 170
-        max_width = width - 260
-        text_y = y1 + 14
-        text_y = draw_wrapped_text(
-            draw,
-            primary,
-            row_main_font,
-            (255, 255, 255),
-            text_x,
-            text_y,
-            max_width,
-            line_spacing=3,
-        )
-
-        if secondary:
-            draw.text((text_x, y2 - 28), secondary, font=row_sub_font, fill=(198, 218, 243))
-
-    footer_y = height - 68
-    draw.text((85, footer_y), "Pick Trax", font=footer_font, fill=(255, 255, 255))
-    draw.text((width - 390, footer_y), "Shop books with buttons below", font=footer_font, fill=(196, 214, 236))
-
-    output = io.BytesIO()
-    img.save(output, format="PNG")
-    output.seek(0)
-    return output
-
-# =========================================================
-# LINK BUILDER RESPONSE
-# =========================================================
-
-async def build_link_this_response(message: discord.Message):
-    attachment = await get_image_attachment_from_context(message)
-    if not attachment:
-        embed = discord.Embed(
-            title="🔗 Pick Trax Betslip Builder",
-            description="Attach a screenshot, or reply to a screenshot and say `link`.",
-            color=discord.Color.red(),
-        )
-        return embed, None, None
-
-    ocr_text = await extract_text_from_image_url(attachment.url)
-    book = detect_sportsbook(ocr_text)
-    meta = parse_betslip_meta(ocr_text)
-
-    if book == "fanduel":
-        legs = parse_fanduel_legs(ocr_text)
-    else:
-        legs = parse_generic_legs(ocr_text)
-
-    confidence_score, confidence_label = score_parse_confidence(book, legs, meta, ocr_text)
-
-    if not legs:
-        preview = ocr_text[:900] if ocr_text else "No OCR text found."
-        embed = discord.Embed(
-            title="🔗 Pick Trax One-Click Builder",
-            description="I read the screenshot, but I could not confidently parse the legs.",
-            color=discord.Color.blue(),
-        )
-        embed.add_field(name="Sportsbook", value=book.title(), inline=True)
-        embed.add_field(name="Confidence", value=f"{confidence_label.title()} ({confidence_score})", inline=True)
-        embed.add_field(name="OCR Preview", value=preview[:1024], inline=False)
-        return embed, None, None
-
-    color = (
-        discord.Color.green() if confidence_label == "high"
-        else discord.Color.gold() if confidence_label == "medium"
-        else discord.Color.blue()
-    )
-
-    found_text = f"Found **{len(legs)}** leg(s)"
-    if meta.get("leg_count"):
-        found_text += f" • OCR saw **{meta['leg_count']}**"
-
-    embed = discord.Embed(
-        title="🔗 Pick Trax One-Click Builder",
-        description=found_text,
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
-
-    embed.add_field(name="Sportsbook", value=book.title(), inline=True)
-    embed.add_field(name="Confidence", value=f"{confidence_label.title()} ({confidence_score})", inline=True)
-
-    if meta.get("odds"):
-        embed.add_field(name="Slip Odds", value=f"{meta['odds']:+d}", inline=True)
-
-    quick_read = (
-        "Ready to shop across books."
-        if confidence_label == "high"
-        else "Looks solid. Double-check one or two legs before placing."
-        if confidence_label == "medium"
-        else "Partial read. A tighter screenshot will help."
-    )
-    embed.add_field(name="Quick Read", value=quick_read, inline=False)
-
-    image_bytes = create_picktrax_card_bytes(
-        legs=legs,
-        book=book,
-        confidence_label=confidence_label,
-        confidence_score=confidence_score,
-        odds=meta.get("odds"),
-        leg_count=meta.get("leg_count"),
-    )
-
-    discord_file = discord.File(fp=image_bytes, filename="picktrax_card.png")
-    embed.set_image(url="attachment://picktrax_card.png")
-    embed.set_footer(text="Use the buttons below to shop supported books.")
-
-    return embed, SportsbookLinksView(legs), discord_file
-
-# =========================================================
-# PICK TRACKING / RECAP HELPERS
-# =========================================================
-
-async def post_recap_if_configured(guild: discord.Guild) -> None:
-    recap_channel = guild.get_channel(DAILY_RECAP_ID)
-    if recap_channel is None:
-        return
-
-    rec = data["record"]
-    graded_decisions = rec["wins"] + rec["losses"]
-    win_rate = (rec["wins"] / graded_decisions * 100) if graded_decisions > 0 else 0.0
-
-    embed = discord.Embed(
-        title="🧾 Current Recap",
-        color=discord.Color.orange(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="Wins", value=str(rec["wins"]), inline=True)
-    embed.add_field(name="Losses", value=str(rec["losses"]), inline=True)
-    embed.add_field(name="Pushes", value=str(rec["pushes"]), inline=True)
-    embed.add_field(name="Profit", value=format_profit(rec["units"]), inline=True)
-    embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
-
-    try:
-        await recap_channel.send(embed=embed)
-    except Exception as e:
-        print(f"Failed to post recap: {e}")
-
-
-async def forward_owner_win(guild: discord.Guild, pick: dict, source_message: Optional[discord.Message]) -> None:
-    wins_channel = guild.get_channel(POST_YOUR_WINS_ID)
-    if wins_channel is None:
-        return
-
-    embed = discord.Embed(
-        title="🏆 Official Win",
-        description=pick["bet"][:4000],
-        color=discord.Color.gold(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="Type", value=pick["play_type"].title(), inline=True)
-    embed.add_field(name="Units", value=f"{pick['units']:.2f}U", inline=True)
-    embed.add_field(name="Odds", value=f"{pick['odds']:+d}", inline=True)
-    embed.add_field(name="Profit", value=format_profit(pick["profit_units"]), inline=True)
-    if pick.get("source_channel_name"):
-        embed.add_field(name="Source", value=pick["source_channel_name"], inline=True)
-
-    files = []
-    if source_message:
-        for attachment in source_message.attachments:
-            try:
-                files.append(await attachment.to_file())
-            except Exception:
-                pass
-
-    try:
-        await wins_channel.send(embed=embed, files=files)
-    except Exception as e:
-        print(f"Failed forwarding official win: {e}")
-
-
-async def forward_member_win(message: discord.Message) -> None:
-    wins_channel = message.guild.get_channel(POST_YOUR_WINS_ID)
-    if wins_channel is None:
-        print("Could not find post-your-wins channel by ID.")
-        return
-
-    role_name = get_best_member_role(message.author)
-
-    embed = discord.Embed(
-        title="🏆 New Winner Submitted",
-        description=message.content[:4000] if message.content else "Winner submitted",
-        color=discord.Color.green() if role_name == VIP_ROLE_NAME else discord.Color.blue(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="User", value=message.author.mention, inline=True)
-    embed.add_field(name="Role", value=role_name, inline=True)
-    embed.add_field(name="Source", value=message.channel.mention, inline=True)
-
-    files = []
-    for attachment in message.attachments:
-        try:
-            files.append(await attachment.to_file())
-        except Exception as e:
-            print(f"attachment error: {e}")
-
-    try:
-        await wins_channel.send(embed=embed, files=files)
-        await message.add_reaction("✅")
-        print("Forwarded winner successfully.")
-    except Exception as e:
-        print(f"Failed forwarding winner: {e}")
-
-
-def apply_grade_to_pick(pick: dict, result: str, grader_id: int) -> tuple[bool, str]:
-    if pick["status"] != "pending":
-        return False, "That pick is already graded."
-
-    odds = int(pick["odds"])
-    units = float(pick["units"])
-
-    pick["status"] = result
-    pick["result"] = result
-    pick["graded_at"] = utc_now_iso()
-    pick["graded_by"] = grader_id
-
-    if result == "win":
-        if odds > 0:
-            profit_units = units * (odds / 100)
-        else:
-            profit_units = units * (100 / abs(odds))
-        data["record"]["wins"] += 1
-    elif result == "loss":
-        profit_units = -units
-        data["record"]["losses"] += 1
-    else:
-        profit_units = 0.0
-        data["record"]["pushes"] += 1
-
-    pick["profit_units"] = round(profit_units, 4)
-    data["record"]["units"] = round(data["record"]["units"] + profit_units, 4)
-
-    data["picks"] = [p for p in data["picks"] if p["status"] == "pending"]
-    data["graded_history"].append(pick)
-    save_data(data)
-
-    return True, (
-        f"✅ Pick #{pick['id']} graded as **{result.upper()}**\n"
-        f"Type: {pick['play_type'].title()}\n"
-        f"Units: {pick['units']:.2f}U\n"
-        f"Profit: {format_profit(pick['profit_units'])}"
-    )
-
-
-def create_auto_pick_from_message(message: discord.Message, play_type: str) -> dict:
-    next_id = len(data["picks"]) + len(data["graded_history"]) + 1
-    units = extract_units_from_text(message.content)
-    odds = extract_odds_from_text(message.content)
-
-    pick = {
-        "id": next_id,
-        "bet": message.content[:500] if message.content else f"Graphic pick from message {message.id}",
-        "units": units,
-        "odds": odds,
-        "status": "pending",
-        "created_by": message.author.id,
-        "created_at": utc_now_iso(),
-        "graded_at": None,
-        "graded_by": None,
-        "result": None,
-        "profit_units": 0.0,
-        "play_type": play_type,
-        "source_message_id": message.id,
-        "source_channel_name": f"#{message.channel.name}",
-    }
-
-    data["picks"].append(pick)
-    data["message_pick_map"][str(message.id)] = pick["id"]
-    data["registered_source_messages"].append(message.id)
-    save_data(data)
-    return pick
+DATA_FILE = "picktrax_data.json"
 
 # =========================================================
 # DISCORD SETUP
@@ -1302,65 +34,262 @@ def create_auto_pick_from_message(message: discord.Message, play_type: str) -> d
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
 intents.guilds = True
+intents.messages = True
+intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# =========================================================
+# DATA HELPERS
+# =========================================================
 
-class GradeView(discord.ui.View):
-    def __init__(self, pick_id: int):
-        super().__init__(timeout=None)
-        self.pick_id = pick_id
+def load_data() -> Dict[str, Any]:
+    if not os.path.exists(DATA_FILE):
+        return {
+            "graded_slips": [],
+            "record": {
+                "wins": 0,
+                "losses": 0,
+                "pushes": 0
+            }
+        }
 
-    async def grade_pick(self, interaction: discord.Interaction, result: str):
-        if data.get("owner_id") and not is_owner_user(interaction.user.id):
-            await interaction.response.send_message(
-                "Only the owner can grade official picks.",
-                ephemeral=True,
-            )
-            return
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "graded_slips": [],
+            "record": {
+                "wins": 0,
+                "losses": 0,
+                "pushes": 0
+            }
+        }
 
-        pick = find_pick_by_id(self.pick_id)
-        if not pick:
-            await interaction.response.send_message(
-                "That pick no longer exists or was already graded.",
-                ephemeral=True,
-            )
-            return
+def save_data(data: Dict[str, Any]) -> None:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
-        ok, msg = apply_grade_to_pick(pick, result, interaction.user.id)
-        if not ok:
-            await interaction.response.send_message(msg, ephemeral=True)
-            return
+data_store = load_data()
 
-        embed = build_pick_embed(pick)
-        await interaction.response.edit_message(embed=embed, view=None)
-        await interaction.followup.send(msg)
+# =========================================================
+# TEXT HELPERS
+# =========================================================
 
-        if interaction.guild:
-            source_message = None
-            try:
-                if pick.get("source_message_id"):
-                    source_message = await interaction.channel.fetch_message(pick["source_message_id"])
-            except Exception:
-                pass
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower()).strip()
 
-            if result == "win":
-                await forward_owner_win(interaction.guild, pick, source_message)
-            await post_recap_if_configured(interaction.guild)
+def has_image_attachment(message: discord.Message) -> bool:
+    if not message.attachments:
+        return False
 
-    @discord.ui.button(label="Win", style=discord.ButtonStyle.success, custom_id="picktrax_win")
-    async def win_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.grade_pick(interaction, "win")
+    for attachment in message.attachments:
+        filename = attachment.filename.lower()
+        if filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            return True
+        if attachment.content_type and attachment.content_type.startswith("image/"):
+            return True
+    return False
 
-    @discord.ui.button(label="Loss", style=discord.ButtonStyle.danger, custom_id="picktrax_loss")
-    async def loss_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.grade_pick(interaction, "loss")
+def is_link_request(text: str) -> bool:
+    text = normalize_text(text)
 
-    @discord.ui.button(label="Push", style=discord.ButtonStyle.secondary, custom_id="picktrax_push")
-    async def push_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.grade_pick(interaction, "push")
+    link_patterns = [
+        "link it",
+        "send the link",
+        "drop the link",
+        "need the link",
+        "give me the link",
+        "post the link",
+        "where the link",
+        "make the link",
+        "build the link",
+        "create the link",
+        "get the link",
+        "can you link",
+        "link this",
+        "link that",
+        "link these",
+        "link slip",
+        "link betslip",
+        "one click",
+        "one-click",
+    ]
+
+    if "link" in text:
+        return True
+
+    return any(p in text for p in link_patterns)
+
+def detect_grade_action(text: str) -> Optional[str]:
+    text = normalize_text(text)
+
+    loss_patterns = [
+        "grade this a loss",
+        "grade as loss",
+        "mark loss",
+        "this is a loss",
+        "graded loss",
+        "grade loss",
+        "loss",
+        "l",
+    ]
+
+    win_patterns = [
+        "grade this a win",
+        "grade as win",
+        "mark win",
+        "this is a win",
+        "graded win",
+        "grade win",
+        "win",
+        "w",
+    ]
+
+    push_patterns = [
+        "grade this a push",
+        "grade as push",
+        "mark push",
+        "this is a push",
+        "graded push",
+        "grade push",
+        "push",
+        "void",
+    ]
+
+    # smarter checks first
+    if "grade" in text or "mark" in text or "graded" in text:
+        if "loss" in text:
+            return "loss"
+        if re.search(r"\bwin\b", text):
+            return "win"
+        if "push" in text or "void" in text:
+            return "push"
+
+    # fallback looser checks
+    if any(p == text for p in loss_patterns):
+        return "loss"
+    if any(p == text for p in win_patterns):
+        return "win"
+    if any(p == text for p in push_patterns):
+        return "push"
+
+    return None
+
+def get_record_text() -> str:
+    record = data_store["record"]
+    return f"Record: ✅ {record['wins']} - ❌ {record['losses']} - ➖ {record['pushes']}"
+
+def message_has_picktrax_mention(message: discord.Message) -> bool:
+    if bot.user is None:
+        return False
+    return bot.user in message.mentions
+
+def is_allowed_channel(message: discord.Message) -> bool:
+    # If you want it everywhere, just return True
+    return message.channel.id in ALLOWED_CHANNEL_IDS
+
+# =========================================================
+# FUTURE AI PLACEHOLDER
+# =========================================================
+
+async def ai_brain_router(message: discord.Message, clean_text: str) -> Optional[str]:
+    """
+    Placeholder for future AI features.
+    Right now this keeps your bot 'AI-ready' without requiring OpenAI setup yet.
+    Later you can plug in:
+    - OCR parsing
+    - betslip extraction
+    - auto summaries
+    - smarter grading
+    - auto recap
+    """
+
+    text = clean_text.lower()
+
+    if "what can you do" in text or "help" in text:
+        return (
+            "**Pick Trax is live.**\n\n"
+            "Here’s what I can do right now:\n"
+            "- Respond when you @mention me\n"
+            "- Detect link requests\n"
+            "- React with 🔗 on image posts that need linking\n"
+            "- Grade slips as win/loss/push\n"
+            "- Track basic record\n\n"
+            "Next upgrades:\n"
+            "- OCR bet slip reading\n"
+            "- Auto link formatting\n"
+            "- AI recap generation\n"
+            "- Unit/profit tracking\n"
+            "- Daily/weekly summaries"
+        )
+
+    return None
+
+# =========================================================
+# GRADE HANDLERS
+# =========================================================
+
+async def handle_grade(message: discord.Message, result: str) -> None:
+    record = data_store["record"]
+
+    if result == "win":
+        record["wins"] += 1
+        emoji = "✅"
+        word = "WIN"
+    elif result == "loss":
+        record["losses"] += 1
+        emoji = "❌"
+        word = "LOSS"
+    else:
+        record["pushes"] += 1
+        emoji = "➖"
+        word = "PUSH"
+
+    data_store["graded_slips"].append({
+        "message_id": str(message.id),
+        "author_id": str(message.author.id),
+        "channel_id": str(message.channel.id),
+        "result": result,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+    save_data(data_store)
+
+    await message.reply(
+        f"{emoji} Graded as **{word}**.\n{get_record_text()}",
+        mention_author=False
+    )
+
+# =========================================================
+# LINK HANDLER
+# =========================================================
+
+async def handle_link_request(message: discord.Message) -> None:
+    replied = False
+
+    # react to image so you know it understands what needs to be done
+    if has_image_attachment(message):
+        try:
+            await message.add_reaction("🔗")
+        except Exception:
+            pass
+
+    # always reply when asked for a link while bot is mentioned
+    try:
+        await message.reply("I got you!", mention_author=False)
+        replied = True
+    except Exception:
+        pass
+
+    # placeholder for actual future link-building logic
+    # later this is where you can parse the image, read slip text, and generate sportsbook links
+    if not replied:
+        try:
+            await message.channel.send("I got you!")
+        except Exception:
+            pass
 
 # =========================================================
 # EVENTS
@@ -1368,302 +297,91 @@ class GradeView(discord.ui.View):
 
 @bot.event
 async def on_ready():
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ Synced {len(synced)} command(s)")
-    except Exception as e:
-        print(f"❌ Sync error: {e}")
-
-    print(f"🔥 Logged in as {bot.user} ({bot.user.id})")
-
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print("Pick Trax is online.")
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    content = (message.content or "").lower().strip()
-    bot_mentioned = bot.user in message.mentions if bot.user else False
-
-    if message.author.id == data.get("owner_id"):
-        has_graphic = len(message.attachments) > 0 or len(message.embeds) > 0
-        if message.channel.id in TRACKED_PICK_CHANNELS and has_graphic:
-            if message.id not in data.get("registered_source_messages", []):
-                play_type = TRACKED_PICK_CHANNELS[message.channel.id]
-                create_auto_pick_from_message(message, play_type)
-                try:
-                    await message.add_reaction("📌")
-                except Exception:
-                    pass
-
-    # Pick Trax should ONLY fire when Pick Trax is explicitly mentioned
-    link_requested = should_trigger_link_builder(content)
-
-    if message.guild and bot_mentioned and link_requested:
-        try:
-            embed, view, file = await build_link_this_response(message)
-            if file:
-                await message.reply(embed=embed, view=view, file=file, mention_author=False)
-            else:
-                await message.reply(embed=embed, view=view, mention_author=False)
-        except Exception as e:
-            await message.reply(
-                embed=discord.Embed(
-                    title="🔗 Pick Trax Betslip Builder",
-                    description=f"Something went wrong while building the slip: {e}",
-                    color=discord.Color.red(),
-                ),
-                mention_author=False,
-            )
+    if not is_allowed_channel(message):
         await bot.process_commands(message)
         return
 
-    result = detect_result(content)
+    content = message.content or ""
+    clean_text = normalize_text(content)
 
-    if message.reference and bot_mentioned and message.author.id == data.get("owner_id"):
-        try:
-            referenced = await message.channel.fetch_message(message.reference.message_id)
-        except Exception:
+    # -----------------------------------------------------
+    # ONLY respond when Pick Trax is actually mentioned
+    # -----------------------------------------------------
+    if message_has_picktrax_mention(message):
+        # 1) link requests
+        if is_link_request(clean_text):
+            await handle_link_request(message)
             await bot.process_commands(message)
             return
 
-        pick_id = data["message_pick_map"].get(str(referenced.id))
-        if pick_id:
-            pick = find_pick_by_id(int(pick_id))
+        # 2) grade requests
+        grade_action = detect_grade_action(clean_text)
+        if grade_action:
+            await handle_grade(message, grade_action)
+            await bot.process_commands(message)
+            return
 
-            if pick and result in {"win", "loss", "push"}:
-                ok, msg = apply_grade_to_pick(pick, result, message.author.id)
-                if ok:
-                    await message.channel.send(msg)
-                    if message.guild:
-                        if result == "win":
-                            await forward_owner_win(message.guild, pick, referenced)
-                        await post_recap_if_configured(message.guild)
-                else:
-                    await message.channel.send(msg)
+        # 3) AI-ready responses
+        ai_response = await ai_brain_router(message, clean_text)
+        if ai_response:
+            await message.reply(ai_response, mention_author=False)
+            await bot.process_commands(message)
+            return
 
-                await bot.process_commands(message)
-                return
-
-            if pick and "grade this" in content:
-                await message.channel.send(
-                    f"Pick #{pick['id']} ready to grade:",
-                    embed=build_pick_embed(pick),
-                    view=GradeView(pick["id"]),
-                )
-                await bot.process_commands(message)
-                return
-
-    if message.guild and bot_mentioned:
-        if message.channel.id in WIN_SUBMISSION_CHANNELS and isinstance(message.author, discord.Member):
-            win_result = detect_result(content)
-            if win_result == "win":
-                await forward_member_win(message)
+        # 4) fallback response when mentioned but unclear
+        await message.reply(
+            "I’m here. Mention me with **link**, **win**, **loss**, or **push**.",
+            mention_author=False
+        )
 
     await bot.process_commands(message)
-
-# =========================================================
-# ERROR HANDLER
-# =========================================================
-
-@bot.tree.error
-async def on_app_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
-):
-    print(f"❌ Slash command error: {error}")
-
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(f"Error: {error}", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"Error: {error}", ephemeral=True)
-    except Exception as e:
-        print(f"❌ Failed to send error message: {e}")
 
 # =========================================================
 # COMMANDS
 # =========================================================
 
-@bot.tree.command(name="ping", description="Test if bot is alive")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("🏓 pong")
+@bot.command(name="record")
+async def record_command(ctx: commands.Context):
+    await ctx.send(get_record_text())
 
+@bot.command(name="resetrecord")
+@commands.has_permissions(administrator=True)
+async def reset_record_command(ctx: commands.Context):
+    data_store["record"] = {
+        "wins": 0,
+        "losses": 0,
+        "pushes": 0
+    }
+    data_store["graded_slips"] = []
+    save_data(data_store)
+    await ctx.send("📊 Record reset.")
 
-@bot.tree.command(name="record", description="Show official record")
-async def record(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=build_record_embed())
-
-
-@bot.tree.command(name="pending", description="List pending official plays")
-async def pending(interaction: discord.Interaction):
-    items = pending_picks()
-
-    if not items:
-        await interaction.response.send_message("📭 No pending picks.")
-        return
-
-    lines = ["📋 **Pending Picks**"]
-    for idx, p in enumerate(items, start=1):
-        lines.append(
-            f"{idx}. ID {p['id']} — {p['play_type'].title()} — {p['units']:.2f}U — {p['source_channel_name']}"
-        )
-
-    await interaction.response.send_message("\n".join(lines))
-
-
-@bot.tree.command(name="grade", description="Grade a pending pick")
-@app_commands.describe(
-    index="The pending pick number from /pending",
-    result="win, loss, or push",
-)
-@app_commands.choices(
-    result=[
-        app_commands.Choice(name="win", value="win"),
-        app_commands.Choice(name="loss", value="loss"),
-        app_commands.Choice(name="push", value="push"),
-    ]
-)
-async def grade(interaction: discord.Interaction, index: int, result: app_commands.Choice[str]):
-    if data.get("owner_id") and not is_owner_user(interaction.user.id):
-        await interaction.response.send_message("Only the owner can grade official picks.", ephemeral=True)
-        return
-
-    items = pending_picks()
-    if not items:
-        await interaction.response.send_message("No pending picks to grade.")
-        return
-
-    if index < 1 or index > len(items):
-        await interaction.response.send_message("Invalid pending pick number.")
-        return
-
-    pick = items[index - 1]
-    ok, msg = apply_grade_to_pick(pick, result.value, interaction.user.id)
-
-    if not ok:
-        await interaction.response.send_message(msg)
-        return
-
-    await interaction.response.send_message(msg)
-
-    if interaction.guild:
-        if result.value == "win":
-            await forward_owner_win(interaction.guild, pick, None)
-        await post_recap_if_configured(interaction.guild)
-
-
-@bot.tree.command(name="recap", description="Show recap for the last N graded picks")
-@app_commands.describe(count="How many recently graded picks to include")
-async def recap(interaction: discord.Interaction, count: Optional[int] = 10):
-    await interaction.response.defer()
-
-    count = max(1, min(count or 10, 25))
-    history = graded_history()[-count:]
-
-    if not history:
-        await interaction.followup.send("📭 No graded picks yet.")
-        return
-
-    wins = sum(1 for p in history if p["result"] == "win")
-    losses = sum(1 for p in history if p["result"] == "loss")
-    pushes = sum(1 for p in history if p["result"] == "push")
-    units = sum(float(p.get("profit_units", 0.0)) for p in history)
-
-    lines = [
-        f"🧾 **Recap — Last {len(history)} Graded Picks**",
-        f"Wins: {wins}",
-        f"Losses: {losses}",
-        f"Pushes: {pushes}",
-        f"Profit: {format_profit(units)}",
-        "",
-    ]
-
-    for p in reversed(history):
-        emoji = "✅" if p["result"] == "win" else "❌" if p["result"] == "loss" else "➖"
-        lines.append(
-            f"{emoji} ID {p['id']} — {p['play_type'].title()} — {p['units']:.2f}U — {format_profit(p['profit_units'])}"
-        )
-
-    await interaction.followup.send("\n".join(lines))
-
-
-@bot.tree.command(name="tailboard", description="Show simple leaderboard summary")
-async def tailboard(interaction: discord.Interaction):
-    rec = data["record"]
-    total = rec["wins"] + rec["losses"] + rec["pushes"]
-    msg = (
-        "🏆 **Tailboard**\n"
-        f"Official picks graded: {total}\n"
-        f"Current profit: {format_profit(rec['units'])}\n"
-        f"Owner set: {'Yes' if data['owner_id'] else 'No'}"
-    )
-    await interaction.response.send_message(msg)
-
-
-@bot.tree.command(name="channelid", description="Show this channel ID")
-async def channelid(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        f"{interaction.channel.name} -> {interaction.channel.id}",
-        ephemeral=True,
+@bot.command(name="picktraxhelp")
+async def picktrax_help(ctx: commands.Context):
+    await ctx.send(
+        "**Pick Trax Commands**\n"
+        "`!record` → shows current record\n"
+        "`!resetrecord` → resets tracked record (admin only)\n\n"
+        "**Mention Triggers**\n"
+        f"`@{bot.user.display_name} link it` → replies *I got you!* and reacts 🔗 if image attached\n"
+        f"`@{bot.user.display_name} grade this a loss` → grades loss\n"
+        f"`@{bot.user.display_name} grade this a win` → grades win\n"
+        f"`@{bot.user.display_name} grade this a push` → grades push"
     )
 
 # =========================================================
-# SETTINGS GROUP
+# START
 # =========================================================
 
-settings_group = app_commands.Group(name="settings", description="Bot settings commands")
+if not DISCORD_TOKEN:
+    raise ValueError("Missing DISCORD_TOKEN environment variable.")
 
-
-@settings_group.command(name="show", description="Show current settings")
-async def settings_show(interaction: discord.Interaction):
-    owner_id = data.get("owner_id")
-    owner_text = f"<@{owner_id}>" if owner_id else "Not set"
-    dollars_text = "On" if data["show_dollars"] else "Off"
-
-    msg = (
-        "⚙️ **Current Settings**\n"
-        f"Owner: {owner_text}\n"
-        f"1 Unit Value: ${float(data['unit_value']):,.2f}\n"
-        f"Show Dollars: {dollars_text}"
-    )
-    await interaction.response.send_message(msg)
-
-
-@settings_group.command(name="set_owner", description="Set the owner user")
-async def settings_set_owner(interaction: discord.Interaction, user: discord.User):
-    data["owner_id"] = user.id
-    save_data(data)
-    await interaction.response.send_message(f"👑 Owner set to {user.mention}")
-
-
-@settings_group.command(name="set_unit_value", description="Set dollar value for 1 unit")
-async def settings_set_unit_value(interaction: discord.Interaction, amount: float):
-    if amount <= 0:
-        await interaction.response.send_message("Unit value must be greater than 0.")
-        return
-
-    data["unit_value"] = float(amount)
-    save_data(data)
-    await interaction.response.send_message(f"💵 1 unit is now set to ${amount:,.2f}")
-
-
-@settings_group.command(name="toggle_dollars", description="Turn dollar display on or off")
-async def settings_toggle_dollars(interaction: discord.Interaction, enabled: bool):
-    data["show_dollars"] = enabled
-    save_data(data)
-    state = "On" if enabled else "Off"
-    await interaction.response.send_message(f"💰 Dollar display is now {state}")
-
-
-bot.tree.add_command(settings_group)
-
-# =========================================================
-# RUN
-# =========================================================
-
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is not set in your environment variables.")
-
-bot.run(TOKEN)
+bot.run(DISCORD_TOKEN)
