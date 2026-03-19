@@ -7,6 +7,7 @@ from io import BytesIO
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
+import aiohttp
 import discord
 from discord.ext import commands
 
@@ -20,12 +21,15 @@ import pytesseract
 # =========================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "").strip()
 if TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 ENV_OWNER_ID = os.getenv("OWNER_ID", "").strip()
+
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 ALLOWED_CHANNEL_IDS = {
     1483485837810335744,  # hammers-aka-singles
@@ -42,6 +46,8 @@ DATA_FILE = "picktrax_data.json"
 MAX_RECENT_SCAN_MESSAGES = 15
 MAX_ATTACHMENTS_TO_SCAN = 3
 MAX_OCR_CHARS = 7000
+MAX_RETURNED_LEGS = 8
+HTTP_TIMEOUT = 18
 
 # =========================================================
 # DISCORD SETUP
@@ -64,15 +70,9 @@ def default_store() -> Dict[str, Any]:
     owner_id = int(ENV_OWNER_ID) if ENV_OWNER_ID.isdigit() else None
     return {
         "graded_slips": [],
-        "record": {
-            "wins": 0,
-            "losses": 0,
-            "pushes": 0
-        },
+        "record": {"wins": 0, "losses": 0, "pushes": 0},
         "parsed_slips": [],
-        "settings": {
-            "owner_id": owner_id
-        }
+        "settings": {"owner_id": owner_id},
     }
 
 def load_data() -> Dict[str, Any]:
@@ -184,10 +184,6 @@ def set_owner_id(owner_id: int) -> None:
     data_store["settings"]["owner_id"] = owner_id
     save_data(data_store)
 
-def user_is_owner(user_id: int) -> bool:
-    owner_id = get_owner_id()
-    return owner_id is not None and owner_id == user_id
-
 def get_record_text() -> str:
     record = data_store["record"]
     return f"Record: ✅ {record['wins']} - ❌ {record['losses']} - ➖ {record['pushes']}"
@@ -227,7 +223,7 @@ def detect_grade_action(text: str) -> Optional[str]:
 
 def detect_ping_request(text: str) -> bool:
     text = normalize_text(text)
-    return any(p in text for p in [" ping", " ping?", "ping", "are you up", "you there", "status"])
+    return text == "ping" or " ping" in f" {text}" or "you there" in text or "status" in text
 
 def detect_show_record_request(text: str) -> bool:
     text = normalize_text(text)
@@ -247,34 +243,31 @@ def detect_set_owner_request(text: str) -> bool:
     return "set owner" in text or "make owner" in text or "owner is" in text
 
 # =========================================================
-# AI-READY PLACEHOLDER
+# AI-READY HELP
 # =========================================================
 
 async def ai_brain_router(message: discord.Message, clean_text: str) -> Optional[str]:
-    text = clean_text.lower()
-
-    if "what can you do" in text or "help" in text:
+    if "what can you do" in clean_text or "help" in clean_text:
         return (
             "**Pick Trax is live.**\n\n"
             "I can currently:\n"
             "- respond when you @mention me\n"
-            "- detect link requests\n"
-            "- react with 🔗 on image posts that need linking\n"
-            "- detect replied-to image posts too\n"
             "- OCR bet slip images\n"
-            "- parse text-based slips into a deep link foundation payload\n"
+            "- clean and parse slips\n"
+            "- build Pick Trax payloads\n"
+            "- send sportsbook fallback links\n"
+            "- try The Odds API bookmaker links when available\n"
             "- grade slips as win/loss/push\n"
-            "- track a basic record\n"
-            "- answer ping / owner / record requests by mention\n\n"
+            "- track record\n"
+            "- answer ping / owner / record requests\n\n"
             "Examples:\n"
             "- `@Pick Trax ping`\n"
             "- `@Pick Trax show record`\n"
             "- `@Pick Trax who is owner`\n"
-            "- `@Pick Trax set owner @user`\n"
+            "- `@Pick Trax set owner me`\n"
             "- `@Pick Trax link this`\n"
             "- `@Pick Trax grade this a win`\n"
         )
-
     return None
 
 # =========================================================
@@ -331,7 +324,6 @@ def preprocess_image_variants(image_bytes: bytes) -> List[np.ndarray]:
     image = cv2.resize(image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
     adaptive = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
     )
@@ -395,6 +387,7 @@ async def ocr_attachment(attachment: discord.Attachment) -> str:
 
 def normalize_ocr_text(text: str) -> str:
     text = text or ""
+
     replacements = {
         "Ower ": "Over ",
         "Ouer ": "Over ",
@@ -403,6 +396,9 @@ def normalize_ocr_text(text: str) -> str:
         "Monayline": "Moneyline",
         "MONEYL INE": "MONEYLINE",
         "MONEY LINE": "MONEYLINE",
+        "TOTAL POITS": "TOTAL POINTS",
+        "TOTAL POWTS": "TOTAL POINTS",
+        "TOTAL POWITS": "TOTAL POINTS",
         "|": " ",
     }
 
@@ -413,73 +409,115 @@ def normalize_ocr_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return clean_text_block(text)
 
+def is_garbage_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+
+    lower = stripped.lower()
+
+    if len(stripped) <= 2:
+        return True
+
+    if re.fullmatch(r"[\W_]+", stripped):
+        return True
+
+    if stripped in {"=", "-", "--", "---", "~~~", "]", "[", "“=", "('", "(' "}:
+        return True
+
+    if sum(ch.isalpha() for ch in stripped) == 0 and "@" not in stripped:
+        return True
+
+    garbage_patterns = [
+        "thy", "teu", "oliio", "momnevilline", "prefinit", "seuiih",
+        "oneerinh", "read betting", "powits", "powts"
+    ]
+    if any(g in lower for g in garbage_patterns) and "@" not in stripped:
+        return True
+
+    return False
+
 def build_candidate_leg_lines_from_ocr(text: str) -> List[str]:
     text = normalize_ocr_text(text)
     raw_lines = [ln.strip("•*- ").strip() for ln in text.split("\n")]
-    raw_lines = [ln for ln in raw_lines if ln]
+    raw_lines = [ln for ln in raw_lines if ln and not is_garbage_line(ln)]
 
     candidates: List[str] = []
     i = 0
+
     while i < len(raw_lines):
         line = raw_lines[i]
         lower = line.lower()
 
         if re.search(r"\b(over|under)\s+\d+(?:\.\d+)?\b", lower):
             combined = line
-            if i + 1 < len(raw_lines):
-                nxt = raw_lines[i + 1]
-                if any(k in nxt.lower() for k in ["total", "points", "rebounds", "assists", "spread", "betting"]):
-                    combined += f" | {nxt}"
-                    i += 1
-            if i + 1 < len(raw_lines):
-                nxt = raw_lines[i + 1]
-                if "@" in nxt:
-                    combined += f" | {nxt}"
-                    i += 1
+
+            if i + 1 < len(raw_lines) and re.search(r"[+-]\d{2,4}", raw_lines[i + 1]):
+                combined += f" | {raw_lines[i + 1]}"
+                i += 1
+
+            if i + 1 < len(raw_lines) and "total" in raw_lines[i + 1].lower():
+                combined += f" | {raw_lines[i + 1]}"
+                i += 1
+
+            if i + 1 < len(raw_lines) and "@" in raw_lines[i + 1]:
+                combined += f" | {raw_lines[i + 1]}"
+                i += 1
+
             candidates.append(combined)
 
         elif "moneyline" in lower:
             prev_line = raw_lines[i - 1] if i - 1 >= 0 else ""
             combined = line
-            if prev_line and "@" not in prev_line and not any(
-                k in prev_line.lower() for k in ["thu", "fri", "sat", "sun", "pm", "et", "total", "spread"]
-            ):
-                combined = f"{prev_line} | {line}"
+
+            if prev_line and "@" not in prev_line and not is_garbage_line(prev_line):
+                if not any(k in prev_line.lower() for k in ["thu", "fri", "sat", "sun", "pm", "et", "total", "spread"]):
+                    combined = f"{prev_line} | {line}"
+
             if i + 1 < len(raw_lines) and "@" in raw_lines[i + 1]:
                 combined += f" | {raw_lines[i + 1]}"
                 i += 1
+
             candidates.append(combined)
 
-        elif re.search(r"[A-Za-z].*[+-]\d+(?:\.\d+)?", line) and (
-            i + 1 < len(raw_lines) and "spread" in raw_lines[i + 1].lower()
-        ):
-            combined = f"{line} | {raw_lines[i + 1]}"
-            if i + 2 < len(raw_lines) and "@" in raw_lines[i + 2]:
-                combined += f" | {raw_lines[i + 2]}"
-                i += 2
-            else:
+        elif re.search(r"[A-Za-z].*[+-]\d+(?:\.\d+)?", line):
+            combined = line
+
+            if i + 1 < len(raw_lines) and "spread" in raw_lines[i + 1].lower():
+                combined += f" | {raw_lines[i + 1]}"
                 i += 1
+
+            if i + 1 < len(raw_lines) and "@" in raw_lines[i + 1]:
+                combined += f" | {raw_lines[i + 1]}"
+                i += 1
+
             candidates.append(combined)
 
         i += 1
 
     for line in raw_lines:
         lower = line.lower()
-        if "@" in line or "moneyline" in lower or "spread" in lower or "over " in lower or "under " in lower:
+        if (
+            "@" in line
+            or "moneyline" in lower
+            or "spread" in lower
+            or "over " in lower
+            or "under " in lower
+        ):
             candidates.append(line)
 
     out: List[str] = []
     seen = set()
     for line in candidates:
         key = normalize_text(line)
-        if key and key not in seen:
+        if key and key not in seen and not is_garbage_line(line):
             seen.add(key)
             out.append(line)
 
     return out
 
 # =========================================================
-# DEEP LINK FOUNDATION
+# PARSING / CLEANUP
 # =========================================================
 
 def empty_leg() -> Dict[str, Any]:
@@ -493,6 +531,7 @@ def empty_leg() -> Dict[str, Any]:
         "sport": None,
         "raw": None,
         "confidence": 0.0,
+        "completeness": 0,
     }
 
 def detect_sport_and_league(text: str) -> Dict[str, Optional[str]]:
@@ -500,7 +539,11 @@ def detect_sport_and_league(text: str) -> Dict[str, Optional[str]]:
 
     if any(k in lower for k in ["nba", "lakers", "celtics", "knicks", "warriors", "rockets"]):
         return {"sport": "basketball", "league": "NBA"}
-    if any(k in lower for k in ["ncaa", "ncaab", "march madness", "ohio state", "wisconsin", "vanderbilt", "louisville", "tcu", "nebraska", "south florida", "high point", "mcneese", "troy"]):
+    if any(k in lower for k in [
+        "ncaa", "ncaab", "march madness", "ohio state", "wisconsin",
+        "vanderbilt", "louisville", "tcu", "nebraska", "south florida",
+        "high point", "mcneese", "troy"
+    ]):
         return {"sport": "basketball", "league": "NCAAB"}
     if any(k in lower for k in ["nfl", "touchdown", "passing yards", "rushing yards"]):
         return {"sport": "football", "league": "NFL"}
@@ -511,9 +554,39 @@ def detect_sport_and_league(text: str) -> Dict[str, Optional[str]]:
 
     return {"sport": None, "league": None}
 
+def compute_leg_completeness(leg: Dict[str, Any]) -> int:
+    score = 0
+    if leg.get("selection"):
+        score += 2
+    if leg.get("market_type"):
+        score += 2
+    if leg.get("line") is not None:
+        score += 2
+    if leg.get("event"):
+        score += 3
+    if leg.get("odds"):
+        score += 2
+    return score
+
+def looks_like_team_name(text: str) -> bool:
+    if not text:
+        return False
+    lower = normalize_text(text)
+    bad = {
+        "moneyline", "spread", "betting", "total", "points", "over", "under",
+        "thu", "fri", "sat", "sun", "pm", "et"
+    }
+    if lower in bad:
+        return False
+    if len(lower) < 3:
+        return False
+    if re.fullmatch(r"[\W_]+", text):
+        return False
+    return True
+
 def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
     raw_line = clean_text_block(line)
-    if not raw_line:
+    if not raw_line or is_garbage_line(raw_line):
         return None
 
     raw_line = raw_line.replace(" | ", " - ")
@@ -532,51 +605,58 @@ def parse_single_leg_from_line(line: str) -> Optional[Dict[str, Any]]:
 
     event_match = re.search(r"([A-Za-z0-9 .&'/-]+)\s+@\s+([A-Za-z0-9 .&'/-]+)", raw_line)
     if event_match:
-        leg["event"] = f"{event_match.group(1).strip()} @ {event_match.group(2).strip()}"
+        away = event_match.group(1).strip()
+        home = event_match.group(2).strip()
+        away = re.sub(r"\bthu.*$", "", away, flags=re.IGNORECASE).strip()
+        home = re.sub(r"\bthu.*$", "", home, flags=re.IGNORECASE).strip()
+        leg["event"] = f"{away} @ {home}"
 
     ou_match = re.search(r"\b(over|under)\s+(\d+(?:\.\d+)?)\b", lower)
     if ou_match:
         leg["market_type"] = "total"
         leg["selection"] = ou_match.group(1).title()
         leg["line"] = safe_float(ou_match.group(2))
-        leg["confidence"] = 0.87
+        leg["confidence"] = 0.88
+        leg["completeness"] = compute_leg_completeness(leg)
         return leg
 
     if "moneyline" in lower:
         cleaned = re.sub(r"\bmoneyline\b", "", raw_line, flags=re.IGNORECASE).strip(" -")
         cleaned = re.sub(r"\s+[+-]\d{2,4}\b", "", cleaned).strip(" -")
+
         if " - " in cleaned:
             first_chunk = cleaned.split(" - ")[0].strip()
         else:
             first_chunk = cleaned.strip()
 
+        first_chunk = re.sub(r"^[('\"\[\]\s]+", "", first_chunk).strip()
+        first_chunk = re.sub(r"[^A-Za-z0-9 .&'/-]+$", "", first_chunk).strip()
+
+        if not looks_like_team_name(first_chunk):
+            return None
+
         leg["market_type"] = "moneyline"
         leg["selection"] = first_chunk
-        leg["confidence"] = 0.82
+        leg["confidence"] = 0.84
+        leg["completeness"] = compute_leg_completeness(leg)
         return leg
 
     spread_match = re.search(r"([A-Za-z0-9 .&'/-]+?)\s+([+-]\d+(?:\.\d+)?)\b", raw_line)
     if spread_match:
         team_candidate = spread_match.group(1).strip(" -")
+
+        team_candidate = re.sub(r"^[^A-Za-z]+", "", team_candidate).strip()
+        team_candidate = re.sub(r"\bthu.*$", "", team_candidate, flags=re.IGNORECASE).strip()
+
         line_candidate = spread_match.group(2)
-        if team_candidate and not team_candidate.lower().startswith(("over", "under")):
+
+        if looks_like_team_name(team_candidate) and not team_candidate.lower().startswith(("over", "under")):
             leg["market_type"] = "spread"
             leg["selection"] = team_candidate
             leg["line"] = safe_float(line_candidate)
-            leg["confidence"] = 0.76
+            leg["confidence"] = 0.80
+            leg["completeness"] = compute_leg_completeness(leg)
             return leg
-
-    player_prop_match = re.search(
-        r"([A-Za-z .'-]+)\s+(\d+(?:\.\d+)?\+?)\s*(points|pts|rebounds|reb|assists|ast|pra|threes|3pm|hits|shots|goals)",
-        lower,
-        flags=re.IGNORECASE
-    )
-    if player_prop_match:
-        leg["market_type"] = "player_prop"
-        leg["selection"] = player_prop_match.group(1).title().strip()
-        leg["line"] = safe_float(player_prop_match.group(2).replace("+", ""))
-        leg["confidence"] = 0.70
-        return leg
 
     return None
 
@@ -585,16 +665,30 @@ def canonical_leg_key(leg: Dict[str, Any]) -> str:
     market_type = normalize_text(str(leg.get("market_type") or ""))
     line = str(leg.get("line") if leg.get("line") is not None else "")
     event = normalize_text(str(leg.get("event") or ""))
-    odds = str(leg.get("odds") or "")
-    return "|".join([selection, market_type, line, event, odds])
+    return "|".join([selection, market_type, line, event])
+
+def related_leg_key(leg: Dict[str, Any]) -> str:
+    selection = normalize_text(str(leg.get("selection") or ""))
+    market_type = normalize_text(str(leg.get("market_type") or ""))
+    line = str(leg.get("line") if leg.get("line") is not None else "")
+    return "|".join([selection, market_type, line])
+
+def choose_better_leg(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    a_score = float(a.get("confidence", 0.0)) + float(a.get("completeness", 0)) * 0.1
+    b_score = float(b.get("confidence", 0.0)) + float(b.get("completeness", 0)) * 0.1
+    return b if b_score > a_score else a
 
 def clean_and_dedupe_legs(legs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     best_by_key: Dict[str, Dict[str, Any]] = {}
-
     for leg in legs:
+        if not leg:
+            continue
         if not leg.get("selection") and not leg.get("event"):
             continue
+        if is_garbage_line(str(leg.get("raw") or "")):
+            continue
 
+        leg["completeness"] = compute_leg_completeness(leg)
         key = canonical_leg_key(leg)
         if not key.strip("|"):
             continue
@@ -602,27 +696,48 @@ def clean_and_dedupe_legs(legs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         existing = best_by_key.get(key)
         if existing is None:
             best_by_key[key] = leg
-            continue
-
-        if float(leg.get("confidence", 0.0)) > float(existing.get("confidence", 0.0)):
-            best_by_key[key] = leg
+        else:
+            best_by_key[key] = choose_better_leg(existing, leg)
 
     cleaned = list(best_by_key.values())
 
-    filtered: List[Dict[str, Any]] = []
+    best_related: Dict[str, Dict[str, Any]] = {}
     for leg in cleaned:
+        rkey = related_leg_key(leg)
+        existing = best_related.get(rkey)
+        if existing is None:
+            best_related[rkey] = leg
+        else:
+            best_related[rkey] = choose_better_leg(existing, leg)
+
+    merged = list(best_related.values())
+
+    filtered: List[Dict[str, Any]] = []
+    for leg in merged:
         market_type = (leg.get("market_type") or "").lower()
         selection = normalize_text(str(leg.get("selection") or ""))
+        raw = normalize_text(str(leg.get("raw") or ""))
 
-        if market_type == "moneyline" and selection in {"moneyline", "m", ""}:
+        if selection in {"moneyline", "spread", "betting", "total", "points", "", "=", "-", "--"}:
             continue
-        if market_type == "spread" and selection in {"spread", "betting", ""}:
+        if raw in {"=", "-", "--", "---", "~~~"}:
+            continue
+        if market_type == "moneyline" and not looks_like_team_name(str(leg.get("selection") or "")):
+            continue
+        if leg.get("confidence", 0.0) < 0.75:
             continue
 
         filtered.append(leg)
 
-    filtered.sort(key=lambda x: (-float(x.get("confidence", 0.0)), normalize_text(str(x.get("selection") or ""))))
-    return filtered[:12]
+    filtered.sort(
+        key=lambda x: (
+            -float(x.get("completeness", 0)),
+            -float(x.get("confidence", 0.0)),
+            normalize_text(str(x.get("selection") or "")),
+        )
+    )
+
+    return filtered[:MAX_RETURNED_LEGS]
 
 def parse_legs_from_text(text: str) -> List[Dict[str, Any]]:
     text = clean_text_block(text)
@@ -643,6 +758,7 @@ def parse_legs_from_text(text: str) -> List[Dict[str, Any]]:
 def parse_legs_from_ocr_text(ocr_text: str) -> List[Dict[str, Any]]:
     candidate_lines = build_candidate_leg_lines_from_ocr(ocr_text)
     parsed: List[Dict[str, Any]] = []
+
     for line in candidate_lines:
         leg = parse_single_leg_from_line(line)
         if leg:
@@ -650,9 +766,13 @@ def parse_legs_from_ocr_text(ocr_text: str) -> List[Dict[str, Any]]:
 
     return clean_and_dedupe_legs(parsed)
 
+# =========================================================
+# PICK TRAX PAYLOAD + FALLBACK LINKS
+# =========================================================
+
 def build_canonical_slip(legs: List[Dict[str, Any]], source_message: discord.Message) -> Dict[str, Any]:
     return {
-        "version": "1.2",
+        "version": "2.1-hybrid",
         "source_message_id": str(source_message.id),
         "source_channel_id": str(source_message.channel.id),
         "source_author_id": str(source_message.author.id),
@@ -665,20 +785,64 @@ def build_picktrax_internal_link(payload: Dict[str, Any]) -> str:
     encoded = compact_json_payload(payload)
     return f"picktrax://slip?payload={encoded}"
 
-def book_adapter_fanduel(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {"book": "FanDuel", "status": "foundation_ready", "url": None}
+def build_picktrax_web_preview_link(payload: Dict[str, Any]) -> str:
+    encoded = compact_json_payload(payload)
+    return f"https://picktrax.app/slip?payload={urllib.parse.quote(encoded)}"
 
-def book_adapter_draftkings(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {"book": "DraftKings", "status": "foundation_ready", "url": None}
+def leg_to_search_phrase(leg: Dict[str, Any]) -> str:
+    selection = str(leg.get("selection") or "").strip()
+    market_type = str(leg.get("market_type") or "").strip()
+    line = leg.get("line")
+    event = str(leg.get("event") or "").strip()
 
-def book_adapter_hardrock(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {"book": "Hard Rock", "status": "foundation_ready", "url": None}
+    parts: List[str] = []
 
-def build_book_adapters(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if selection:
+        parts.append(selection)
+
+    if market_type == "moneyline":
+        parts.append("moneyline")
+    elif market_type == "spread" and line is not None:
+        parts.append(str(line))
+    elif market_type == "total" and line is not None:
+        parts.append(str(line))
+
+    if event:
+        parts.append(event)
+
+    return " ".join(parts).strip()
+
+def build_sportsbook_links(legs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    phrases = [leg_to_search_phrase(leg) for leg in legs if leg_to_search_phrase(leg)]
+    query = " ; ".join(phrases[:6])
+    encoded = urllib.parse.quote(query)
+
     return [
-        book_adapter_fanduel(payload),
-        book_adapter_draftkings(payload),
-        book_adapter_hardrock(payload),
+        {
+            "book": "FanDuel",
+            "label": "Search slip",
+            "url": f"https://sportsbook.fanduel.com/search?query={encoded}",
+        },
+        {
+            "book": "DraftKings",
+            "label": "Search slip",
+            "url": f"https://sportsbook.draftkings.com/search?query={encoded}",
+        },
+        {
+            "book": "Hard Rock",
+            "label": "Search slip",
+            "url": f"https://hardrock.bet/search?query={encoded}",
+        },
+        {
+            "book": "Caesars",
+            "label": "Search slip",
+            "url": f"https://sportsbook.caesars.com/search?query={encoded}",
+        },
+        {
+            "book": "BetMGM",
+            "label": "Search slip",
+            "url": f"https://sports.betmgm.com/en/search?query={encoded}",
+        },
     ]
 
 def format_leg_summary(leg: Dict[str, Any], idx: int) -> str:
@@ -694,6 +858,197 @@ def format_leg_summary(leg: Dict[str, Any], idx: int) -> str:
     if leg.get("odds"):
         parts.append(f"[{leg['odds']}]")
     return " ".join(parts)
+
+# =========================================================
+# THE ODDS API HELPERS
+# =========================================================
+
+def team_aliases(team_name: str) -> List[str]:
+    base = normalize_text(team_name)
+    aliases = {base}
+
+    replacements = {
+        "south florida": ["usf", "south florida", "bulls"],
+        "ohio state": ["ohio state", "buckeyes"],
+        "high point": ["high point"],
+        "mcneese": ["mcneese", "mcneese state"],
+        "wisconsin": ["wisconsin", "badgers"],
+        "vanderbilt": ["vanderbilt", "commodores"],
+        "tcu": ["tcu", "horned frogs"],
+        "louisville": ["louisville", "cardinals"],
+        "troy": ["troy"],
+        "nebraska": ["nebraska", "cornhuskers"],
+    }
+
+    if base in replacements:
+        aliases.update(replacements[base])
+
+    return list(aliases)
+
+def event_matches_leg(leg: Dict[str, Any], event: Dict[str, Any]) -> bool:
+    leg_event = str(leg.get("event") or "")
+    if "@" not in leg_event:
+        return False
+
+    away, home = [part.strip() for part in leg_event.split("@", 1)]
+    event_home = normalize_text(str(event.get("home_team") or ""))
+    event_away = normalize_text(str(event.get("away_team") or ""))
+
+    away_aliases = team_aliases(away)
+    home_aliases = team_aliases(home)
+
+    return (
+        event_away in away_aliases and event_home in home_aliases
+    )
+
+def bookmaker_matches_leg(leg: Dict[str, Any], bookmaker: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    market_type = str(leg.get("market_type") or "").lower()
+    selection = str(leg.get("selection") or "").strip()
+    line = leg.get("line")
+    event = str(leg.get("event") or "")
+
+    markets = bookmaker.get("markets") or []
+    for market in markets:
+        key = str(market.get("key") or "").lower()
+        outcomes = market.get("outcomes") or []
+
+        # Moneyline
+        if market_type == "moneyline" and key == "h2h":
+            for outcome in outcomes:
+                name = normalize_text(str(outcome.get("name") or ""))
+                if name in team_aliases(selection):
+                    return True, outcome.get("link") or market.get("link") or bookmaker.get("link")
+
+        # Spread
+        if market_type == "spread" and key == "spreads":
+            for outcome in outcomes:
+                name = normalize_text(str(outcome.get("name") or ""))
+                point = outcome.get("point")
+                if name in team_aliases(selection) and point is not None:
+                    try:
+                        if abs(float(point) - float(line)) < 0.01:
+                            return True, outcome.get("link") or market.get("link") or bookmaker.get("link")
+                    except Exception:
+                        continue
+
+        # Total
+        if market_type == "total" and key == "totals":
+            for outcome in outcomes:
+                name = normalize_text(str(outcome.get("name") or ""))
+                point = outcome.get("point")
+                expected_side = normalize_text(selection)
+                if name == expected_side and point is not None:
+                    try:
+                        if abs(float(point) - float(line)) < 0.01:
+                            return True, outcome.get("link") or market.get("link") or bookmaker.get("link")
+                    except Exception:
+                        continue
+
+    return False, None
+
+def books_grouped_by_count(book_matches: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows = list(book_matches.values())
+    rows.sort(key=lambda x: (-x["matched_count"], x["book"]))
+    return rows
+
+async def fetch_odds_api_events_for_sport(session: aiohttp.ClientSession, sport_key: str) -> List[Dict[str, Any]]:
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "us",
+        "markets": "h2h,spreads,totals",
+        "includeLinks": "true",
+        "oddsFormat": "american",
+    }
+
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
+    try:
+        async with session.get(url, params=params, timeout=HTTP_TIMEOUT) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            if isinstance(data, list):
+                return data
+            return []
+    except Exception:
+        return []
+
+async def build_the_odds_api_book_links(legs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not ODDS_API_KEY or not legs:
+        return []
+
+    sports_needed = set()
+    for leg in legs:
+        sport = str(leg.get("sport") or "").lower()
+        league = str(leg.get("league") or "").upper()
+        if sport == "basketball" and league == "NCAAB":
+            sports_needed.add("basketball_ncaab")
+        elif sport == "basketball" and league == "NBA":
+            sports_needed.add("basketball_nba")
+
+    if not sports_needed:
+        return []
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+
+    all_events: List[Dict[str, Any]] = []
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        for sport_key in sports_needed:
+            events = await fetch_odds_api_events_for_sport(session, sport_key)
+            all_events.extend(events)
+
+    if not all_events:
+        return []
+
+    book_matches: Dict[str, Dict[str, Any]] = {}
+
+    for leg in legs:
+        matching_events = [event for event in all_events if event_matches_leg(leg, event)]
+        if not matching_events:
+            continue
+
+        for event in matching_events:
+            for bookmaker in event.get("bookmakers") or []:
+                matched, link = bookmaker_matches_leg(leg, bookmaker)
+                if not matched:
+                    continue
+
+                book_key = str(bookmaker.get("key") or bookmaker.get("title") or "unknown")
+                book_title = str(bookmaker.get("title") or book_key)
+
+                if book_key not in book_matches:
+                    book_matches[book_key] = {
+                        "book": book_title,
+                        "matched_count": 0,
+                        "links": [],
+                        "legs": [],
+                    }
+
+                book_matches[book_key]["matched_count"] += 1
+                book_matches[book_key]["legs"].append(leg_to_search_phrase(leg))
+                if link:
+                    book_matches[book_key]["links"].append(link)
+
+    grouped = books_grouped_by_count(book_matches)
+    for row in grouped:
+        deduped_links = []
+        seen_links = set()
+        for link in row["links"]:
+            if link and link not in seen_links:
+                seen_links.add(link)
+                deduped_links.append(link)
+        row["links"] = deduped_links[:3]
+
+        deduped_legs = []
+        seen_legs = set()
+        for item in row["legs"]:
+            key = normalize_text(item)
+            if key and key not in seen_legs:
+                seen_legs.add(key)
+                deduped_legs.append(item)
+        row["legs"] = deduped_legs
+
+    return grouped[:6]
 
 # =========================================================
 # EXTRACTION PIPELINE
@@ -745,13 +1100,12 @@ async def extract_structured_legs_from_message(target_message: discord.Message) 
         if not parsed_legs:
             parsed_legs = ocr_legs
         else:
-            merged = parsed_legs + ocr_legs
-            parsed_legs = clean_and_dedupe_legs(merged)
+            parsed_legs = clean_and_dedupe_legs(parsed_legs + ocr_legs)
 
     return parsed_legs, target_text, ocr_text
 
 # =========================================================
-# OWNER / SMART COMMAND HELPERS
+# OWNER / MENTION COMMANDS
 # =========================================================
 
 async def resolve_owner_target_user(message: discord.Message) -> Optional[discord.Member]:
@@ -772,12 +1126,9 @@ async def resolve_owner_target_user(message: discord.Message) -> Optional[discor
 
     id_match = re.search(r"\b(\d{17,20})\b", message.content or "")
     if id_match and message.guild:
-        try:
-            member = message.guild.get_member(int(id_match.group(1)))
-            if member:
-                return member
-        except Exception:
-            pass
+        member = message.guild.get_member(int(id_match.group(1)))
+        if member:
+            return member
 
     return None
 
@@ -785,7 +1136,8 @@ async def handle_ping_request(message: discord.Message) -> None:
     latency_ms = round(bot.latency * 1000)
     owner_id = get_owner_id()
     owner_note = f"\nOwner ID: `{owner_id}`" if owner_id else "\nOwner ID: `not set`"
-    await message.reply(f"🏓 Pong! `{latency_ms}ms`{owner_note}", mention_author=False)
+    odds_note = "\nOdds API: `connected`" if ODDS_API_KEY else "\nOdds API: `not set`"
+    await message.reply(f"🏓 Pong! `{latency_ms}ms`{owner_note}{odds_note}", mention_author=False)
 
 async def handle_show_record_request(message: discord.Message) -> None:
     await message.reply(f"📊 {get_record_text()}", mention_author=False)
@@ -796,10 +1148,7 @@ async def handle_who_is_owner_request(message: discord.Message) -> None:
         await message.reply("👑 No owner is set right now.", mention_author=False)
         return
 
-    member = None
-    if message.guild:
-        member = message.guild.get_member(owner_id)
-
+    member = message.guild.get_member(owner_id) if message.guild else None
     if member:
         await message.reply(f"👑 Current owner: {member.mention} (`{owner_id}`)", mention_author=False)
     else:
@@ -808,7 +1157,6 @@ async def handle_who_is_owner_request(message: discord.Message) -> None:
 async def handle_set_owner_request(message: discord.Message) -> None:
     current_owner_id = get_owner_id()
 
-    # Only current owner can change it, unless none exists yet.
     if current_owner_id is not None and message.author.id != current_owner_id:
         await message.reply("🚫 Only the current owner can change the owner setting.", mention_author=False)
         return
@@ -880,11 +1228,9 @@ async def handle_link_request(message: discord.Message) -> None:
 
     parsed_legs, native_text, ocr_text = await extract_structured_legs_from_message(target_message)
     payload = None
-    adapters: List[Dict[str, Any]] = []
 
     if parsed_legs:
         payload = build_canonical_slip(parsed_legs, target_message)
-        adapters = build_book_adapters(payload)
 
         data_store["parsed_slips"].append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -897,18 +1243,33 @@ async def handle_link_request(message: discord.Message) -> None:
     response_lines = ["I got you!"]
 
     if parsed_legs and payload:
+        sportsbook_links = build_sportsbook_links(parsed_legs)
+        odds_api_books = await build_the_odds_api_book_links(parsed_legs)
+
         response_lines.append("")
-        response_lines.append("**Deep Link Foundation Ready**")
-        response_lines.append(f"Recognized **{len(parsed_legs)}** leg(s).")
+        response_lines.append("**Pick Trax Slip Ready**")
+        response_lines.append(f"Recognized **{len(parsed_legs)}** clean leg(s).")
         response_lines.append("")
         response_lines.extend(format_leg_summary(leg, idx + 1) for idx, leg in enumerate(parsed_legs))
         response_lines.append("")
         response_lines.append("**Pick Trax Payload**")
         response_lines.append(f"`{truncate(build_picktrax_internal_link(payload), 350)}`")
         response_lines.append("")
-        response_lines.append("**Book Adapters**")
-        for adapter in adapters:
-            response_lines.append(f"- {adapter['book']}: {adapter['status']}")
+        response_lines.append("**Pick Trax Preview**")
+        response_lines.append(build_picktrax_web_preview_link(payload))
+
+        if odds_api_books:
+            response_lines.append("")
+            response_lines.append("**Matched Books (The Odds API)**")
+            for row in odds_api_books:
+                response_lines.append(f"- {row['book']}: {row['matched_count']}/{len(parsed_legs)} leg(s) matched")
+                for link in row["links"][:2]:
+                    response_lines.append(f"  {link}")
+
+        response_lines.append("")
+        response_lines.append("**Sportsbook Fallback Links**")
+        for item in sportsbook_links:
+            response_lines.append(f"- {item['book']}: {item['url']}")
 
         if ocr_text:
             response_lines.append("")
@@ -922,21 +1283,16 @@ async def handle_link_request(message: discord.Message) -> None:
                 response_lines.append("")
                 response_lines.append("**OCR Preview**")
                 response_lines.append(f"```{truncate(ocr_text, 800)}```")
-            response_lines.append("")
-            response_lines.append("Foundation is installed. Next step would be improving sport/book-specific parsing.")
         else:
-            response_lines.append("I found the target, but I still need readable slip text or an image to build the deep link payload.")
+            response_lines.append("I found the target, but I still need readable slip text or an image to build the slip.")
 
     try:
         await message.reply("\n".join(response_lines), mention_author=False)
     except Exception:
-        try:
-            await message.channel.send("\n".join(response_lines))
-        except Exception:
-            pass
+        await message.channel.send("\n".join(response_lines))
 
 # =========================================================
-# TEXT COMMANDS
+# PREFIX COMMANDS
 # =========================================================
 
 @bot.command(name="record")
@@ -1019,7 +1375,6 @@ async def on_message(message: discord.Message):
     clean_text = normalize_text(content)
 
     if message_has_picktrax_mention(message):
-        # Mention-based modern AI commands
         if detect_set_owner_request(clean_text):
             await handle_set_owner_request(message)
             await bot.process_commands(message)
