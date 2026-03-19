@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
@@ -14,7 +13,6 @@ from discord.ext import commands
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Optional: if you want to limit actions to certain channels, add IDs here
 ALLOWED_CHANNEL_IDS = {
     1483485837810335744,  # hammers-aka-singles
     1483433966227947619,  # parlays
@@ -91,6 +89,7 @@ def has_image_attachment(message: discord.Message) -> bool:
             return True
         if attachment.content_type and attachment.content_type.startswith("image/"):
             return True
+
     return False
 
 def is_link_request(text: str) -> bool:
@@ -98,6 +97,7 @@ def is_link_request(text: str) -> bool:
 
     link_patterns = [
         "link it",
+        "link this",
         "send the link",
         "drop the link",
         "need the link",
@@ -109,7 +109,6 @@ def is_link_request(text: str) -> bool:
         "create the link",
         "get the link",
         "can you link",
-        "link this",
         "link that",
         "link these",
         "link slip",
@@ -126,40 +125,6 @@ def is_link_request(text: str) -> bool:
 def detect_grade_action(text: str) -> Optional[str]:
     text = normalize_text(text)
 
-    loss_patterns = [
-        "grade this a loss",
-        "grade as loss",
-        "mark loss",
-        "this is a loss",
-        "graded loss",
-        "grade loss",
-        "loss",
-        "l",
-    ]
-
-    win_patterns = [
-        "grade this a win",
-        "grade as win",
-        "mark win",
-        "this is a win",
-        "graded win",
-        "grade win",
-        "win",
-        "w",
-    ]
-
-    push_patterns = [
-        "grade this a push",
-        "grade as push",
-        "mark push",
-        "this is a push",
-        "graded push",
-        "grade push",
-        "push",
-        "void",
-    ]
-
-    # smarter checks first
     if "grade" in text or "mark" in text or "graded" in text:
         if "loss" in text:
             return "loss"
@@ -168,12 +133,11 @@ def detect_grade_action(text: str) -> Optional[str]:
         if "push" in text or "void" in text:
             return "push"
 
-    # fallback looser checks
-    if any(p == text for p in loss_patterns):
+    if text in {"loss", "l"}:
         return "loss"
-    if any(p == text for p in win_patterns):
+    if text in {"win", "w"}:
         return "win"
-    if any(p == text for p in push_patterns):
+    if text in {"push", "void"}:
         return "push"
 
     return None
@@ -188,43 +152,56 @@ def message_has_picktrax_mention(message: discord.Message) -> bool:
     return bot.user in message.mentions
 
 def is_allowed_channel(message: discord.Message) -> bool:
-    # If you want it everywhere, just return True
     return message.channel.id in ALLOWED_CHANNEL_IDS
 
 # =========================================================
-# FUTURE AI PLACEHOLDER
+# AI-READY PLACEHOLDER
 # =========================================================
 
 async def ai_brain_router(message: discord.Message, clean_text: str) -> Optional[str]:
-    """
-    Placeholder for future AI features.
-    Right now this keeps your bot 'AI-ready' without requiring OpenAI setup yet.
-    Later you can plug in:
-    - OCR parsing
-    - betslip extraction
-    - auto summaries
-    - smarter grading
-    - auto recap
-    """
-
     text = clean_text.lower()
 
     if "what can you do" in text or "help" in text:
         return (
             "**Pick Trax is live.**\n\n"
-            "Here’s what I can do right now:\n"
-            "- Respond when you @mention me\n"
-            "- Detect link requests\n"
-            "- React with 🔗 on image posts that need linking\n"
-            "- Grade slips as win/loss/push\n"
-            "- Track basic record\n\n"
+            "I can currently:\n"
+            "- respond when you @mention me\n"
+            "- detect link requests\n"
+            "- react with 🔗 on image posts that need linking\n"
+            "- detect replied-to image posts too\n"
+            "- grade slips as win/loss/push\n"
+            "- track a basic record\n\n"
             "Next upgrades:\n"
             "- OCR bet slip reading\n"
-            "- Auto link formatting\n"
+            "- auto leg extraction\n"
+            "- auto one-click link flow\n"
             "- AI recap generation\n"
-            "- Unit/profit tracking\n"
-            "- Daily/weekly summaries"
+            "- unit/profit tracking"
         )
+
+    return None
+
+# =========================================================
+# LINK HELPERS
+# =========================================================
+
+async def get_target_image_message(message: discord.Message) -> Optional[discord.Message]:
+    # 1) current message has the image
+    if has_image_attachment(message):
+        return message
+
+    # 2) replied-to message has the image
+    if message.reference and message.reference.message_id:
+        try:
+            referenced = message.reference.resolved
+
+            if referenced is None:
+                referenced = await message.channel.fetch_message(message.reference.message_id)
+
+            if referenced and has_image_attachment(referenced):
+                return referenced
+        except Exception:
+            return None
 
     return None
 
@@ -267,29 +244,27 @@ async def handle_grade(message: discord.Message, result: str) -> None:
 # =========================================================
 
 async def handle_link_request(message: discord.Message) -> None:
-    replied = False
+    target_message = await get_target_image_message(message)
 
-    # react to image so you know it understands what needs to be done
-    if has_image_attachment(message):
+    if target_message:
         try:
-            await message.add_reaction("🔗")
+            await target_message.add_reaction("🔗")
         except Exception:
             pass
 
-    # always reply when asked for a link while bot is mentioned
     try:
         await message.reply("I got you!", mention_author=False)
-        replied = True
     except Exception:
-        pass
-
-    # placeholder for actual future link-building logic
-    # later this is where you can parse the image, read slip text, and generate sportsbook links
-    if not replied:
         try:
             await message.channel.send("I got you!")
         except Exception:
             pass
+
+    # future upgrade:
+    # OCR target_message attachments
+    # parse legs
+    # build real link
+    # send formatted card/link result
 
 # =========================================================
 # EVENTS
@@ -312,31 +287,24 @@ async def on_message(message: discord.Message):
     content = message.content or ""
     clean_text = normalize_text(content)
 
-    # -----------------------------------------------------
-    # ONLY respond when Pick Trax is actually mentioned
-    # -----------------------------------------------------
     if message_has_picktrax_mention(message):
-        # 1) link requests
         if is_link_request(clean_text):
             await handle_link_request(message)
             await bot.process_commands(message)
             return
 
-        # 2) grade requests
         grade_action = detect_grade_action(clean_text)
         if grade_action:
             await handle_grade(message, grade_action)
             await bot.process_commands(message)
             return
 
-        # 3) AI-ready responses
         ai_response = await ai_brain_router(message, clean_text)
         if ai_response:
             await message.reply(ai_response, mention_author=False)
             await bot.process_commands(message)
             return
 
-        # 4) fallback response when mentioned but unclear
         await message.reply(
             "I’m here. Mention me with **link**, **win**, **loss**, or **push**.",
             mention_author=False
@@ -366,15 +334,17 @@ async def reset_record_command(ctx: commands.Context):
 
 @bot.command(name="picktraxhelp")
 async def picktrax_help(ctx: commands.Context):
+    bot_name = bot.user.display_name if bot.user else "Pick Trax"
     await ctx.send(
         "**Pick Trax Commands**\n"
         "`!record` → shows current record\n"
         "`!resetrecord` → resets tracked record (admin only)\n\n"
         "**Mention Triggers**\n"
-        f"`@{bot.user.display_name} link it` → replies *I got you!* and reacts 🔗 if image attached\n"
-        f"`@{bot.user.display_name} grade this a loss` → grades loss\n"
-        f"`@{bot.user.display_name} grade this a win` → grades win\n"
-        f"`@{bot.user.display_name} grade this a push` → grades push"
+        f"`@{bot_name} link it` → replies *I got you!*\n"
+        f"`@{bot_name} link this` while replying to an image → reacts 🔗 on the image\n"
+        f"`@{bot_name} grade this a loss` → grades loss\n"
+        f"`@{bot_name} grade this a win` → grades win\n"
+        f"`@{bot_name} grade this a push` → grades push"
     )
 
 # =========================================================
