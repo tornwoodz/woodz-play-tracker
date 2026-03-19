@@ -287,6 +287,37 @@ def detect_result(text: str) -> Optional[str]:
     return None
 
 
+def should_trigger_link_builder(content: str) -> bool:
+    text = (content or "").lower().strip()
+
+    # Must contain the word "link"
+    if not re.search(r"\blink\b", text):
+        return False
+
+    # Don't let grading / record phrases trigger it
+    blocked_phrases = [
+        "grade this",
+        "cash this",
+        "mark win",
+        "mark loss",
+        "mark push",
+        "grade win",
+        "grade loss",
+        "grade push",
+        "this hit",
+        "this lost",
+        "this pushed",
+        "won this",
+        "green this",
+        "red this",
+    ]
+
+    if any(phrase in text for phrase in blocked_phrases):
+        return False
+
+    return True
+
+
 def get_best_member_role(member: discord.Member) -> str:
     role_names = {role.name for role in member.roles}
 
@@ -437,7 +468,6 @@ def smart_parse_legs(ocr_text: str):
         if re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", line):
             continue
 
-        # Team spreads, including OCR where it inserts spaces around minus
         spread_match = re.search(
             r"^([A-Za-z][A-Za-z\s\.]+?)\s+([+-]\s*\d+(?:\.\d+)?)\s*$",
             line,
@@ -454,7 +484,6 @@ def smart_parse_legs(ocr_text: str):
             })
             continue
 
-        # Team spreads with period text on same line
         spread_period_match = re.search(
             r"^([A-Za-z][A-Za-z\s\.]+?)\s+([+-]\s*\d+(?:\.\d+)?)\s+(1st Half|1st Quarter|2nd Half|2nd Quarter|3rd Quarter|4th Quarter)$",
             line,
@@ -473,7 +502,6 @@ def smart_parse_legs(ocr_text: str):
             })
             continue
 
-        # Player alt lines: 14+ Michael Porter Jr. - Points
         player_plus_match = re.search(
             r"^(\d+(?:\.\d+)?)\+\s+([A-Za-z\.'\-\s]+?)\s*-\s*(Points|Assists|Rebounds|PRA|PA|PR|AR|Pts|Ast|Reb)\s*$",
             line,
@@ -493,7 +521,6 @@ def smart_parse_legs(ocr_text: str):
             })
             continue
 
-        # Player over/under format: Jayson Tatum Over 4.5 Assists
         player_ou_match = re.search(
             r"^([A-Za-z\.'\-\s]+?)\s+(Over|Under)\s+(\d+(?:\.\d+)?)\s+(Points|Assists|Rebounds|PRA|PA|PR|AR|Pts|Ast|Reb)\s*$",
             line,
@@ -514,7 +541,6 @@ def smart_parse_legs(ocr_text: str):
             })
             continue
 
-        # Team moneyline
         ml_match = re.search(r"^([A-Za-z][A-Za-z\s\.]+?)\s+ML$", line, re.IGNORECASE)
         if ml_match:
             team = normalize_team(ml_match.group(1))
@@ -558,7 +584,6 @@ class SportsbookLinksView(discord.ui.View):
             if not url:
                 continue
             label = book.title()
-            # keep buttons working even without exact deeplinks
             if query:
                 target = f"{url}?q={quote_plus(query)}"
             else:
@@ -913,8 +938,8 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
-    # New: link this flow, separated from cash this / win forwarding
-    if message.guild and bot_mentioned and "link this" in content:
+    # Link builder trigger
+    if message.guild and bot_mentioned and should_trigger_link_builder(content):
         try:
             embed, view = await build_link_this_response(message)
             await message.reply(embed=embed, view=view, mention_author=False)
