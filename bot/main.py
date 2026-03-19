@@ -1,9 +1,12 @@
 import os
 import re
 import json
+import difflib
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict, Any
+from urllib.parse import quote_plus
 
+import aiohttp
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -39,6 +42,104 @@ WIN_SUBMISSION_CHANNELS = {
 VIP_ROLE_NAME = "🏆VIP"
 PUB_ROLE_NAME = "🆓PUB"
 
+LINK_TRIGGER_PHRASES = (
+    "link this",
+    "build this",
+    "make slip",
+    "make this slip",
+    "pick trax link this",
+)
+
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "").strip()
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+DEFAULT_SPORT = os.getenv("DEFAULT_SPORT", "basketball_nba").strip() or "basketball_nba"
+SUPPORTED_BOOKS = [
+    b.strip() for b in os.getenv(
+        "SUPPORTED_BOOKS",
+        "fanduel,draftkings,betmgm,caesars,espnbet,fanatics",
+    ).split(",") if b.strip()
+]
+
+BOOK_LABELS = {
+    "fanduel": "FanDuel",
+    "draftkings": "DraftKings",
+    "betmgm": "BetMGM",
+    "caesars": "Caesars",
+    "espnbet": "ESPN BET",
+    "fanatics": "Fanatics",
+    "hardrockbet": "Hard Rock",
+    "bet365": "bet365",
+    "pointsbetus": "PointsBet",
+}
+
+SEARCH_BASES = {
+    "fanduel": "https://sportsbook.fanduel.com/",
+    "draftkings": "https://sportsbook.draftkings.com/",
+    "betmgm": "https://sports.betmgm.com/",
+    "caesars": "https://sportsbook.caesars.com/us/",
+    "espnbet": "https://espnbet.com/",
+    "fanatics": "https://sportsbook.fanatics.com/",
+    "hardrockbet": "https://app.hardrock.bet/",
+    "bet365": "https://www.bet365.com/",
+    "pointsbetus": "https://pointsbet.com/",
+}
+
+STAT_MARKET_MAP = {
+    "points": "player_points",
+    "pts": "player_points",
+    "rebounds": "player_rebounds",
+    "reb": "player_rebounds",
+    "boards": "player_rebounds",
+    "assists": "player_assists",
+    "ast": "player_assists",
+    "pra": "player_points_rebounds_assists",
+    "points+rebounds+assists": "player_points_rebounds_assists",
+    "pr": "player_points_rebounds",
+    "points+rebounds": "player_points_rebounds",
+    "pa": "player_points_assists",
+    "points+assists": "player_points_assists",
+    "ra": "player_rebounds_assists",
+    "rebounds+assists": "player_rebounds_assists",
+    "threes": "player_threes",
+    "3pt": "player_threes",
+    "3pts": "player_threes",
+    "three-pointers": "player_threes",
+}
+
+TEAM_ALIASES = {
+    "okc": "oklahoma city thunder",
+    "thunder": "oklahoma city thunder",
+    "nets": "brooklyn nets",
+    "knicks": "new york knicks",
+    "celtics": "boston celtics",
+    "lakers": "los angeles lakers",
+    "clippers": "los angeles clippers",
+    "pelicans": "new orleans pelicans",
+    "pacers": "indiana pacers",
+    "blazers": "portland trail blazers",
+    "sixers": "philadelphia 76ers",
+    "76ers": "philadelphia 76ers",
+    "wolves": "minnesota timberwolves",
+    "mavs": "dallas mavericks",
+    "bucks": "milwaukee bucks",
+    "heat": "miami heat",
+    "magic": "orlando magic",
+    "hawks": "atlanta hawks",
+    "bulls": "chicago bulls",
+    "cavs": "cleveland cavaliers",
+    "spurs": "san antonio spurs",
+    "warriors": "golden state warriors",
+    "suns": "phoenix suns",
+    "kings": "sacramento kings",
+    "grizzlies": "memphis grizzlies",
+    "rockets": "houston rockets",
+    "hornets": "charlotte hornets",
+    "pistons": "detroit pistons",
+    "wizards": "washington wizards",
+    "jazz": "utah jazz",
+    "raptors": "toronto raptors",
+    "nuggets": "denver nuggets",
+}
 
 # =========================================================
 # STORAGE
@@ -215,6 +316,11 @@ def detect_result(text: str) -> Optional[str]:
     return None
 
 
+def should_trigger_link_this(content: str) -> bool:
+    lowered = (content or "").lower()
+    return any(phrase in lowered for phrase in LINK_TRIGGER_PHRASES)
+
+
 def get_best_member_role(member: discord.Member) -> str:
     role_names = {role.name for role in member.roles}
 
@@ -293,6 +399,65 @@ def build_record_embed() -> discord.Embed:
     embed.add_field(name="Profit", value=format_profit(rec["units"]), inline=True)
     embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
     return embed
+
+
+def clean_name(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", text.lower()).strip()
+
+
+def normalize_whitespace(text: str) -> str:
+    text = text.replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
+
+def normalize_team_name(name: str) -> str:
+    lowered = clean_name(name)
+    return TEAM_ALIASES.get(lowered, lowered)
+
+
+def fuzzy_ratio(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, clean_name(a), clean_name(b)).ratio()
+
+
+def extract_image_attachment(message: discord.Message) -> Optional[discord.Attachment]:
+    for attachment in message.attachments:
+        ct = (attachment.content_type or "").lower()
+        filename = (attachment.filename or "").lower()
+        if ct.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            return attachment
+    return None
+
+
+def build_search_query_for_leg(leg: Dict[str, Any]) -> str:
+    side = leg.get("side", "")
+    line = leg.get("line", "")
+    stat = leg.get("stat", "")
+    player = leg.get("player", "")
+    if leg.get("kind") == "team_ml":
+        return f"{leg.get('team', '')} moneyline"
+    if leg.get("kind") == "team_spread":
+        return f"{leg.get('team', '')} spread {leg.get('spread', '')}"
+    return " ".join(str(x) for x in [player, side, line, stat] if x).strip()
+
+
+def build_book_search_url(book_key: str, leg: Dict[str, Any]) -> str:
+    base = SEARCH_BASES.get(book_key, "https://www.google.com/search?q=")
+    query = build_search_query_for_leg(leg)
+    if "google.com/search" in base:
+        return f"{base}{quote_plus(query)}"
+    return base
+
+
+def unique_ordered(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 async def post_recap_if_configured(guild: discord.Guild) -> None:
@@ -467,6 +632,371 @@ def create_auto_pick_from_message(message: discord.Message, play_type: str) -> d
 
 
 # =========================================================
+# LINK THIS OCR + PARSING
+# =========================================================
+
+async def fetch_message_from_reference(message: discord.Message) -> Optional[discord.Message]:
+    if not message.reference or not message.reference.message_id:
+        return None
+    try:
+        return await message.channel.fetch_message(message.reference.message_id)
+    except Exception as e:
+        print(f"Failed to fetch referenced message: {e}")
+        return None
+
+
+async def resolve_link_target_message(message: discord.Message) -> discord.Message:
+    referenced = await fetch_message_from_reference(message)
+    if referenced:
+        return referenced
+    return message
+
+
+async def ocr_attachment_with_ocr_space(attachment: discord.Attachment) -> str:
+    if not OCR_SPACE_API_KEY:
+        raise RuntimeError("OCR_SPACE_API_KEY is missing.")
+
+    payload = aiohttp.FormData()
+    payload.add_field("apikey", OCR_SPACE_API_KEY)
+    payload.add_field("language", "eng")
+    payload.add_field("OCREngine", "2")
+    payload.add_field("isOverlayRequired", "false")
+    payload.add_field("scale", "true")
+    payload.add_field("detectOrientation", "true")
+
+    raw = await attachment.read()
+    payload.add_field(
+        "file",
+        raw,
+        filename=attachment.filename or "slip.png",
+        content_type=attachment.content_type or "application/octet-stream",
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://api.ocr.space/parse/image", data=payload, timeout=60) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"OCR request failed ({resp.status}): {text[:300]}")
+            try:
+                parsed = json.loads(text)
+            except Exception as e:
+                raise RuntimeError(f"OCR response parse failed: {e}")
+
+    if parsed.get("IsErroredOnProcessing"):
+        errors = parsed.get("ErrorMessage") or parsed.get("ErrorDetails") or "OCR processing failed."
+        raise RuntimeError(str(errors))
+
+    chunks = []
+    for result in parsed.get("ParsedResults", []):
+        chunk = (result.get("ParsedText") or "").strip()
+        if chunk:
+            chunks.append(chunk)
+
+    return normalize_whitespace("\n".join(chunks))
+
+
+def parse_ocr_text_into_legs(text: str) -> List[Dict[str, Any]]:
+    text = normalize_whitespace(text)
+    lines = [line.strip(" -•\t") for line in text.split("\n") if line.strip()]
+    legs: List[Dict[str, Any]] = []
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        combined = f"{line} {next_line}".strip()
+
+        leg = parse_single_leg(combined)
+        if leg:
+            legs.append(leg)
+            i += 2
+            continue
+
+        leg = parse_single_leg(line)
+        if leg:
+            legs.append(leg)
+        i += 1
+
+    return dedupe_legs(legs)
+
+
+def dedupe_legs(legs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for leg in legs:
+        key = (
+            leg.get("kind"),
+            clean_name(leg.get("player", "")),
+            clean_name(leg.get("team", "")),
+            leg.get("side"),
+            leg.get("line"),
+            clean_name(leg.get("stat", "")),
+            leg.get("spread"),
+        )
+        if key not in seen:
+            seen.add(key)
+            out.append(leg)
+    return out
+
+
+def parse_single_leg(line: str) -> Optional[Dict[str, Any]]:
+    raw = normalize_whitespace(line)
+    lowered = raw.lower()
+    lowered = lowered.replace(" o ", " over ").replace(" u ", " under ")
+    lowered = re.sub(r"\bo\s*(\d)", r"over \1", lowered)
+    lowered = re.sub(r"\bu\s*(\d)", r"under \1", lowered)
+
+    # Team moneyline
+    ml_match = re.search(r"([a-z .'-]+)\s+(ml|moneyline)\b", lowered)
+    if ml_match:
+        team = ml_match.group(1).strip()
+        return {
+            "kind": "team_ml",
+            "team": normalize_team_name(team),
+            "display": f"{team.title()} ML",
+            "raw": raw,
+        }
+
+    # Team spread
+    spread_match = re.search(r"([a-z .'-]+)\s+([+-]\d+(?:\.\d+)?)\b", lowered)
+    if spread_match and len(spread_match.group(1).split()) <= 4:
+        maybe_team = spread_match.group(1).strip()
+        maybe_spread = spread_match.group(2)
+        if normalize_team_name(maybe_team) != clean_name(maybe_team) or maybe_team in TEAM_ALIASES:
+            return {
+                "kind": "team_spread",
+                "team": normalize_team_name(maybe_team),
+                "spread": maybe_spread,
+                "display": f"{maybe_team.title()} {maybe_spread}",
+                "raw": raw,
+            }
+
+    player_patterns = [
+        r"(?P<player>[a-z .'-]{4,})\s+(?P<side>over|under)\s+(?P<line>\d+(?:\.\d+)?)\s+(?P<stat>points\+rebounds\+assists|points\+rebounds|points\+assists|rebounds\+assists|points|rebounds|assists|pra|pr|pa|ra|pts|reb|ast|3pts|3pt|threes?)\b",
+        r"(?P<player>[a-z .'-]{4,})\s+(?P<stat>points\+rebounds\+assists|points\+rebounds|points\+assists|rebounds\+assists|points|rebounds|assists|pra|pr|pa|ra|pts|reb|ast|3pts|3pt|threes?)\s+(?P<side>over|under)\s+(?P<line>\d+(?:\.\d+)?)\b",
+        r"(?P<player>[a-z .'-]{4,})\s+(?P<line>\d+(?:\.\d+)?)\+\s*(?P<stat>points\+rebounds\+assists|points\+rebounds|points\+assists|rebounds\+assists|points|rebounds|assists|pra|pr|pa|ra|pts|reb|ast|3pts|3pt|threes?)\b",
+    ]
+
+    for pattern in player_patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            player = " ".join(match.group("player").split())
+            stat = match.group("stat").strip()
+            market = STAT_MARKET_MAP.get(stat, STAT_MARKET_MAP.get(stat.replace(" ", ""), ""))
+            side = match.groupdict().get("side") or "over"
+            line = float(match.group("line"))
+            return {
+                "kind": "player_prop",
+                "player": player.title(),
+                "stat": stat,
+                "market": market,
+                "side": side,
+                "line": line,
+                "display": f"{player.title()} {side.title()} {line:g} {stat.upper() if stat in {'pra','pr','pa','ra','pts','reb','ast'} else stat.title()}",
+                "raw": raw,
+            }
+
+    return None
+
+
+def collect_required_markets(legs: List[Dict[str, Any]]) -> List[str]:
+    markets = []
+    for leg in legs:
+        kind = leg.get("kind")
+        if kind == "team_ml":
+            markets.append("h2h")
+        elif kind == "team_spread":
+            markets.append("spreads")
+        elif kind == "player_prop" and leg.get("market"):
+            markets.append(leg["market"])
+    if not markets:
+        markets = ["h2h", "spreads", "player_points", "player_rebounds", "player_assists"]
+    return unique_ordered(markets)
+
+
+async def fetch_odds_snapshot(markets: List[str]) -> List[Dict[str, Any]]:
+    if not ODDS_API_KEY:
+        return []
+
+    url = f"https://api.the-odds-api.com/v4/sports/{DEFAULT_SPORT}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "us",
+        "markets": ",".join(markets[:8]),
+        "bookmakers": ",".join(SUPPORTED_BOOKS[:10]),
+        "oddsFormat": "american",
+        "includeLinks": "true",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params, timeout=45) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                print(f"Odds API error {resp.status}: {text[:400]}")
+                return []
+            try:
+                payload = json.loads(text)
+                if isinstance(payload, list):
+                    return payload
+            except Exception as e:
+                print(f"Odds JSON parse failed: {e}")
+    return []
+
+
+def outcome_desc(outcome: Dict[str, Any]) -> str:
+    return " ".join(
+        str(outcome.get(k, "")) for k in ("name", "description") if outcome.get(k)
+    ).strip()
+
+
+def market_point_value(outcome: Dict[str, Any]) -> Optional[float]:
+    point = outcome.get("point")
+    if point is None:
+        return None
+    try:
+        return float(point)
+    except Exception:
+        return None
+
+
+def bookmaker_link_from_book(bookmaker: Dict[str, Any]) -> Optional[str]:
+    for key in ("betslip", "event", "link", "market"):
+        link = ((bookmaker.get("links") or {}).get(key) if isinstance(bookmaker.get("links"), dict) else None)
+        if isinstance(link, str) and link.startswith("http"):
+            return link
+    return None
+
+
+def outcome_link(outcome: Dict[str, Any]) -> Optional[str]:
+    for key in ("link", "betslip", "url"):
+        link = outcome.get(key)
+        if isinstance(link, str) and link.startswith("http"):
+            return link
+    return None
+
+
+def match_leg_to_outcome(leg: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, str]:
+    matched: Dict[str, str] = {}
+    kind = leg.get("kind")
+
+    for event in events:
+        for bookmaker in event.get("bookmakers", []):
+            book_key = bookmaker.get("key")
+            if not book_key or book_key in matched:
+                continue
+
+            best_link = None
+            best_score = 0.0
+
+            for market in bookmaker.get("markets", []):
+                mkey = market.get("key")
+                if kind == "player_prop" and mkey != leg.get("market"):
+                    continue
+                if kind == "team_ml" and mkey != "h2h":
+                    continue
+                if kind == "team_spread" and mkey != "spreads":
+                    continue
+
+                for outcome in market.get("outcomes", []):
+                    score = 0.0
+                    if kind == "player_prop":
+                        desc = outcome_desc(outcome)
+                        score += fuzzy_ratio(desc, leg.get("player", ""))
+                        side_name = clean_name(outcome.get("name", ""))
+                        desired_side = clean_name(leg.get("side", ""))
+                        if desired_side and desired_side in side_name:
+                            score += 0.5
+                        point = market_point_value(outcome)
+                        if point is not None and abs(point - float(leg.get("line", 0.0))) < 0.11:
+                            score += 0.9
+                    elif kind == "team_ml":
+                        team = normalize_team_name(leg.get("team", ""))
+                        score += fuzzy_ratio(outcome.get("name", ""), team)
+                    elif kind == "team_spread":
+                        team = normalize_team_name(leg.get("team", ""))
+                        score += fuzzy_ratio(outcome.get("name", ""), team)
+                        point = market_point_value(outcome)
+                        try:
+                            wanted = float(leg.get("spread"))
+                            if point is not None and abs(point - wanted) < 0.11:
+                                score += 0.9
+                        except Exception:
+                            pass
+
+                    if score > best_score:
+                        best_score = score
+                        best_link = outcome_link(outcome) or bookmaker_link_from_book(bookmaker)
+
+            if best_link and best_score >= 1.15:
+                matched[book_key] = best_link
+
+    return matched
+
+
+class BookButtons(discord.ui.View):
+    def __init__(self, buttons: List[tuple[str, str]]):
+        super().__init__(timeout=300)
+        for label, url in buttons[:5]:
+            self.add_item(discord.ui.Button(label=label[:80], url=url))
+
+
+async def build_link_this_response(target_message: discord.Message) -> tuple[discord.Embed, Optional[discord.ui.View]]:
+    attachment = extract_image_attachment(target_message)
+    if not attachment:
+        raise RuntimeError("Reply to a screenshot and say @Pick Trax link this.")
+
+    ocr_text = await ocr_attachment_with_ocr_space(attachment)
+    if not ocr_text:
+        raise RuntimeError("I could not read any text from that screenshot.")
+
+    legs = parse_ocr_text_into_legs(ocr_text)
+    embed = discord.Embed(
+        title="🔗 Pick Trax Betslip Builder",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text="Reply to a screenshot with @Pick Trax link this")
+
+    if not legs:
+        embed.description = "I read the screenshot, but I could not confidently parse the legs."
+        preview = ocr_text[:900]
+        embed.add_field(name="OCR Preview", value=preview or "No OCR text", inline=False)
+        return embed, None
+
+    embed.description = f"Parsed **{len(legs)}** leg(s) from the screenshot."
+    leg_lines = [f"• {leg.get('display', leg.get('raw', 'Unknown leg'))}" for leg in legs[:12]]
+    embed.add_field(name="Parsed Legs", value="\n".join(leg_lines)[:1024], inline=False)
+
+    matched_links: Dict[str, str] = {}
+    if ODDS_API_KEY:
+        markets = collect_required_markets(legs)
+        events = await fetch_odds_snapshot(markets)
+        for leg in legs:
+            per_leg = match_leg_to_outcome(leg, events)
+            for book_key, url in per_leg.items():
+                matched_links.setdefault(book_key, url)
+
+    buttons: List[tuple[str, str]] = []
+    for book_key in SUPPORTED_BOOKS:
+        label = BOOK_LABELS.get(book_key, book_key.title())
+        url = matched_links.get(book_key)
+        if not url:
+            # fallback to the sportsbook homepage so members can still open the book fast
+            url = build_book_search_url(book_key, legs[0])
+        buttons.append((label, url))
+
+    found_count = len([bk for bk in SUPPORTED_BOOKS if bk in matched_links])
+    embed.add_field(
+        name="Book Links",
+        value=f"Matched deep links for **{found_count}/{len(SUPPORTED_BOOKS)}** supported book(s).",
+        inline=False,
+    )
+
+    embed.add_field(name="OCR Preview", value=ocr_text[:900], inline=False)
+    return embed, BookButtons(buttons)
+
+
+# =========================================================
 # DISCORD SETUP
 # =========================================================
 
@@ -555,6 +1085,7 @@ async def on_message(message: discord.Message):
     content = (message.content or "").lower().strip()
     bot_mentioned = bot.user in message.mentions if bot.user else False
 
+    # KEEP EXISTING CASH/WIN FLOW EXACTLY AS-IS
     if message.author.id == data.get("owner_id"):
         has_graphic = len(message.attachments) > 0 or len(message.embeds) > 0
         if message.channel.id in TRACKED_PICK_CHANNELS and has_graphic:
@@ -601,6 +1132,17 @@ async def on_message(message: discord.Message):
                 )
                 await bot.process_commands(message)
                 return
+
+    # NEW: LINK THIS FLOW
+    if message.guild and bot_mentioned and should_trigger_link_this(content):
+        try:
+            target_message = await resolve_link_target_message(message)
+            embed, view = await build_link_this_response(target_message)
+            await message.channel.send(embed=embed, view=view)
+        except Exception as e:
+            await message.channel.send(f"❌ Link this failed: {e}")
+        await bot.process_commands(message)
+        return
 
     if message.guild and bot_mentioned:
         if message.channel.id in WIN_SUBMISSION_CHANNELS and isinstance(message.author, discord.Member):
@@ -766,6 +1308,19 @@ async def channelid(interaction: discord.Interaction):
         f"{interaction.channel.name} -> {interaction.channel.id}",
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="linkthis", description="Reply to a screenshot and build sportsbook links")
+async def linkthis(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        if not interaction.channel:
+            await interaction.followup.send("This command must be used in a server channel.")
+            return
+        # Slash commands cannot directly inspect a reply context reliably, so this is just guidance.
+        await interaction.followup.send("Reply to the screenshot and type `@Pick Trax link this`.")
+    except Exception as e:
+        await interaction.followup.send(f"Error: {e}")
 
 
 # =========================================================
