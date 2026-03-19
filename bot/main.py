@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import aiohttp
 import discord
@@ -8,6 +9,7 @@ from typing import Optional
 from urllib.parse import quote_plus
 from discord.ext import commands
 from discord import app_commands
+from PIL import Image, ImageDraw, ImageFont
 
 DATA_FILE = "picktrax_data.json"
 
@@ -346,7 +348,8 @@ def get_best_member_role(member: discord.Member) -> str:
 
 
 def find_pick_by_id(pick_id: int) -> Optional[dict]:
-    for pick in data["picks"]:
+    combined = list(data.get("picks", [])) + list(data.get("graded_history", []))
+    for pick in combined:
         if pick["id"] == pick_id:
             return pick
     return None
@@ -557,7 +560,6 @@ def group_lines_into_blocks(lines: list[str]) -> list[list[str]]:
         if not stripped:
             continue
 
-        # new leg-ish line starts
         starts_new = False
 
         if re.search(r"^(over|under)\s+\d+(\.\d+)?$", stripped, re.IGNORECASE):
@@ -675,7 +677,6 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
     for block in blocks:
         text = " | ".join(block)
 
-        # direct single-line parse from any line
         parsed = None
         for line in block:
             parsed = parse_single_line_leg(line)
@@ -683,7 +684,6 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
                 break
 
         if parsed:
-            # attach matchup context for totals if nearby
             if parsed["type"] == "total":
                 for b in block:
                     if looks_like_matchup(b):
@@ -692,8 +692,6 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
             legs.append(parsed)
             continue
 
-        # FanDuel stacked total:
-        # Over 140.5 / TOTAL POINTS / UMBC / Howard
         if len(block) >= 2:
             first = block[0]
             second = block[1]
@@ -711,8 +709,6 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
                 legs.append(leg)
                 continue
 
-        # FanDuel stacked moneyline:
-        # Prairie View A&M / MONEYLINE / Prairie View A&M / Lehigh
         if len(block) >= 2 and block[1].lower() == "moneyline":
             legs.append({
                 "type": "moneyline",
@@ -721,8 +717,6 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
             })
             continue
 
-        # FanDuel stacked spread:
-        # Miami (OH) +13.5 / ALTERNATE SPREAD 2 / Miami (OH) / SMU
         m_spread = re.search(
             r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\d+(?:\.\d+)?)$",
             block[0],
@@ -737,8 +731,6 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
             })
             continue
 
-        # 3-line player prop:
-        # Kevin Durant / 15+ / Points
         if len(block) >= 3:
             player_line = block[0]
             line_line = block[1]
@@ -757,7 +749,6 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
                 })
                 continue
 
-    # dedupe
     deduped = []
     seen = set()
     for leg in legs:
@@ -892,10 +883,157 @@ async def get_image_attachment_from_context(message: discord.Message) -> Optiona
     return None
 
 # =========================================================
+# VISUAL CARD RENDERING
+# =========================================================
+
+def safe_font(size: int, bold: bool = False):
+    candidates = []
+    if bold:
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+        ]
+    else:
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except Exception:
+            continue
+
+    return ImageFont.load_default()
+
+
+def draw_wrapped_text(draw, text, font, fill, x, y, max_width, line_spacing=6):
+    words = text.split()
+    lines = []
+    current = ""
+
+    for word in words:
+        test = word if not current else f"{current} {word}"
+        bbox = draw.textbbox((0, 0), test, font=font)
+        width = bbox[2] - bbox[0]
+        if width <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    for line in lines:
+        draw.text((x, y), line, font=font, fill=fill)
+        bbox = draw.textbbox((0, 0), line, font=font)
+        y += (bbox[3] - bbox[1]) + line_spacing
+
+    return y
+
+
+def create_picktrax_card_bytes(
+    legs: list[dict],
+    book: str,
+    confidence_label: str,
+    confidence_score: int,
+    odds: Optional[int] = None,
+    leg_count: Optional[int] = None,
+) -> io.BytesIO:
+    width = 1400
+    row_height = 118
+    header_h = 200
+    footer_h = 110
+    max_legs = min(len(legs), 8)
+    height = header_h + (row_height * max_legs) + footer_h
+
+    img = Image.new("RGB", (width, height), (10, 14, 22))
+    draw = ImageDraw.Draw(img)
+
+    draw.rounded_rectangle((30, 30, width - 30, height - 30), radius=36, fill=(18, 26, 40))
+    draw.rounded_rectangle((50, 50, width - 50, 170), radius=28, fill=(15, 92, 190))
+    draw.rounded_rectangle((70, 95, 300, 150), radius=18, fill=(12, 34, 62))
+
+    title_font = safe_font(52, bold=True)
+    sub_font = safe_font(28, bold=False)
+    chip_font = safe_font(24, bold=True)
+    row_title_font = safe_font(34, bold=True)
+    row_sub_font = safe_font(25, bold=False)
+    footer_font = safe_font(28, bold=True)
+
+    draw.text((90, 72), "Pick Trax - One Click Betslip", font=title_font, fill=(255, 255, 255))
+
+    subtitle = f"{book.title()} • {confidence_label.title()} Confidence ({confidence_score})"
+    if odds:
+        subtitle += f" • {odds:+d}"
+    draw.text((90, 128), subtitle, font=sub_font, fill=(220, 235, 255))
+
+    chip_text = f"{max_legs}/{leg_count if leg_count else max_legs} Bets Found"
+    chip_bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
+    chip_w = chip_bbox[2] - chip_bbox[0]
+    draw.rounded_rectangle((width - chip_w - 140, 92, width - 90, 145), radius=18, fill=(8, 26, 48))
+    draw.text((width - chip_w - 115, 104), chip_text, font=chip_font, fill=(255, 255, 255))
+
+    start_y = 205
+    for idx, leg in enumerate(legs[:8], start=1):
+        y1 = start_y + ((idx - 1) * row_height)
+        y2 = y1 + row_height - 18
+
+        fill = (16, 53, 102) if idx % 2 == 1 else (14, 43, 83)
+        draw.rounded_rectangle((75, y1, width - 75, y2), radius=22, fill=fill)
+
+        draw.rounded_rectangle((95, y1 + 20, 150, y1 + 72), radius=14, fill=(9, 24, 44))
+        draw.text((114, y1 + 27), str(idx), font=row_sub_font, fill=(255, 255, 255))
+
+        primary = leg_to_display(leg)
+        secondary = ""
+
+        if leg["type"] == "moneyline":
+            secondary = "Moneyline"
+        elif leg["type"] == "spread":
+            secondary = "Spread"
+        elif leg["type"] == "player_prop":
+            secondary = "Player Prop"
+        elif leg["type"] == "total":
+            secondary = "Game Total"
+
+        text_x = 175
+        text_max_width = width - 290
+        text_y = y1 + 16
+        text_y = draw_wrapped_text(
+            draw,
+            primary,
+            row_title_font,
+            (255, 255, 255),
+            text_x,
+            text_y,
+            text_max_width,
+            line_spacing=4,
+        )
+
+        if secondary:
+            draw.text((text_x, y2 - 38), secondary, font=row_sub_font, fill=(195, 215, 240))
+
+    draw.text((90, height - 82), "Pick Trax", font=footer_font, fill=(255, 255, 255))
+    draw.text((width - 430, height - 82), "Tap buttons below to shop books", font=sub_font, fill=(190, 210, 235))
+
+    output = io.BytesIO()
+    img.save(output, format="PNG")
+    output.seek(0)
+    return output
+
+# =========================================================
 # LINK BUILDER RESPONSE
 # =========================================================
 
-async def build_link_this_response(message: discord.Message) -> tuple[discord.Embed, Optional[discord.ui.View]]:
+async def build_link_this_response(message: discord.Message):
     attachment = await get_image_attachment_from_context(message)
     if not attachment:
         embed = discord.Embed(
@@ -903,7 +1041,7 @@ async def build_link_this_response(message: discord.Message) -> tuple[discord.Em
             description="Attach a screenshot, or reply to a screenshot and say `link`.",
             color=discord.Color.red(),
         )
-        return embed, None
+        return embed, None, None
 
     ocr_text = await extract_text_from_image_url(attachment.url)
     book = detect_sportsbook(ocr_text)
@@ -926,7 +1064,7 @@ async def build_link_this_response(message: discord.Message) -> tuple[discord.Em
         embed.add_field(name="Sportsbook", value=book.title(), inline=True)
         embed.add_field(name="Confidence", value=f"{confidence_label.title()} ({confidence_score})", inline=True)
         embed.add_field(name="OCR Preview", value=preview[:1024], inline=False)
-        return embed, None
+        return embed, None, None
 
     color = discord.Color.green() if confidence_label == "high" else (
         discord.Color.gold() if confidence_label == "medium" else discord.Color.blue()
@@ -949,22 +1087,29 @@ async def build_link_this_response(message: discord.Message) -> tuple[discord.Em
     if meta.get("odds"):
         embed.add_field(name="Slip Odds", value=f"{meta['odds']:+d}", inline=True)
 
-    display_lines = []
-    for idx, leg in enumerate(legs[:10], start=1):
-        display_lines.append(f"**{idx}.** {leg_to_display(leg)}")
-
-    embed.add_field(name="Parsed Legs", value="\n".join(display_lines)[:1024], inline=False)
-
-    if confidence_label == "high":
-        quick_read = "Ready to shop across books."
-    elif confidence_label == "medium":
-        quick_read = "Looks solid. Double-check one or two legs before placing."
-    else:
-        quick_read = "Partial read. A tighter screenshot will help."
+    quick_read = (
+        "Ready to shop across books."
+        if confidence_label == "high"
+        else "Looks solid. Double-check one or two legs before placing."
+        if confidence_label == "medium"
+        else "Partial read. A tighter screenshot will help."
+    )
     embed.add_field(name="Quick Read", value=quick_read, inline=False)
 
+    image_bytes = create_picktrax_card_bytes(
+        legs=legs,
+        book=book,
+        confidence_label=confidence_label,
+        confidence_score=confidence_score,
+        odds=meta.get("odds"),
+        leg_count=meta.get("leg_count"),
+    )
+
+    discord_file = discord.File(fp=image_bytes, filename="picktrax_card.png")
+    embed.set_image(url="attachment://picktrax_card.png")
     embed.set_footer(text="Reply to a screenshot with 'link' or mention the bot with 'link'.")
-    return embed, SportsbookLinksView(legs)
+
+    return embed, SportsbookLinksView(legs), discord_file
 
 # =========================================================
 # PICK TRACKING / RECAP HELPERS
@@ -1235,8 +1380,11 @@ async def on_message(message: discord.Message):
 
     if message.guild and link_requested and (bot_mentioned or has_image_context):
         try:
-            embed, view = await build_link_this_response(message)
-            await message.reply(embed=embed, view=view, mention_author=False)
+            embed, view, file = await build_link_this_response(message)
+            if file:
+                await message.reply(embed=embed, view=view, file=file, mention_author=False)
+            else:
+                await message.reply(embed=embed, view=view, mention_author=False)
         except Exception as e:
             await message.reply(
                 embed=discord.Embed(
