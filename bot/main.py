@@ -5,7 +5,7 @@ import json
 import aiohttp
 import discord
 from datetime import datetime, timezone
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple
 from urllib.parse import quote_plus
 from discord.ext import commands
 from discord import app_commands
@@ -42,8 +42,7 @@ WIN_SUBMISSION_CHANNELS = {
 VIP_ROLE_NAME = "🏆VIP"
 PUB_ROLE_NAME = "🆓PUB"
 
-OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld").strip()
-
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
 SUPPORTED_BOOKS = [
     b.strip().lower()
     for b in os.getenv(
@@ -62,26 +61,6 @@ BOOK_URLS = {
     "fanatics": "https://sportsbook.fanatics.com/",
     "hardrockbet": "https://app.hardrock.bet/",
     "bet365": "https://www.bet365.com/",
-}
-
-# SharpSports
-SHARP_SPORTS_API_KEY = os.getenv("SHARP_SPORTS_API_KEY", "").strip()
-SHARP_SPORTS_BASE_URL = os.getenv("SHARP_SPORTS_BASE_URL", "https://api.sharpsports.io/v1").rstrip("/")
-SHARP_SPORTS_UI_BASE = os.getenv("SHARP_SPORTS_UI_BASE", "https://ui.sharpsports.io").rstrip("/")
-SHARP_HTTP_TIMEOUT = int(os.getenv("SHARP_HTTP_TIMEOUT", "20"))
-
-# Helpful fallback aliases if /books payload does not give a clean abbr match
-SHARP_BOOK_ABBR_HINTS = {
-    "fanduel": ["fd"],
-    "draftkings": ["dk"],
-    "betmgm": ["mg", "mb", "betmgm"],
-    "caesars": ["ca", "cz"],
-    "espnbet": ["pn", "espn", "eb", "pb"],
-    "fanatics": ["fb", "fa", "fanatics"],
-    "hardrockbet": ["hr", "hb", "hardrock"],
-    "betrivers": ["br", "pb"],
-    "pointsbet": ["pb"],
-    "pinnacle": ["pi", "pn"],
 }
 
 TEAM_ALIASES = {
@@ -132,6 +111,10 @@ TEAM_ALIASES = {
     "high point": "High Point",
     "mcneese": "McNeese",
     "houston": "Houston Rockets",
+    "kansas": "Kansas",
+    "kentucky": "Kentucky",
+    "north carolina": "North Carolina",
+    "villanova": "Villanova",
 }
 
 STAT_ALIASES = {
@@ -152,27 +135,6 @@ STAT_ALIASES = {
     "pa": "Points + Assists",
     "pr": "Points + Rebounds",
     "ar": "Assists + Rebounds",
-}
-
-SEGMENT_ALIASES = {
-    "1st half": "1st Half",
-    "first half": "1st Half",
-    "1h": "1st Half",
-    "2nd half": "2nd Half",
-    "second half": "2nd Half",
-    "2h": "2nd Half",
-    "1st quarter": "1st Quarter",
-    "first quarter": "1st Quarter",
-    "q1": "1st Quarter",
-    "2nd quarter": "2nd Quarter",
-    "second quarter": "2nd Quarter",
-    "q2": "2nd Quarter",
-    "3rd quarter": "3rd Quarter",
-    "third quarter": "3rd Quarter",
-    "q3": "3rd Quarter",
-    "4th quarter": "4th Quarter",
-    "fourth quarter": "4th Quarter",
-    "q4": "4th Quarter",
 }
 
 # =========================================================
@@ -512,54 +474,6 @@ def find_target_user_for_owner(message: discord.Message) -> Optional[discord.Mem
 
     return None
 
-
-def normalize_stat(raw: str) -> str:
-    return STAT_ALIASES.get(raw.strip().lower(), raw.strip().title())
-
-
-def normalize_team(raw: str) -> str:
-    cleaned = re.sub(r"\s+", " ", raw).strip(" -")
-    lowered = cleaned.lower()
-    return TEAM_ALIASES.get(lowered, cleaned.title())
-
-
-def normalize_player(raw: str) -> str:
-    cleaned = re.sub(r"\s+", " ", raw).strip(" .-")
-    return cleaned.title()
-
-
-def normalize_segment(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return None
-    lowered = normalize_text(raw)
-    return SEGMENT_ALIASES.get(lowered, raw.strip().title())
-
-
-def team_tokens(raw: str) -> List[str]:
-    base = normalize_text(raw)
-    if not base:
-        return []
-    alt = normalize_text(TEAM_ALIASES.get(base, raw))
-    tokens = {base, alt}
-    return [t for t in tokens if t]
-
-
-def canonical_metric_name(stat_name: Optional[str]) -> Optional[str]:
-    if not stat_name:
-        return None
-    mapping = {
-        "points": "points",
-        "assists": "assists",
-        "rebounds": "rebounds",
-        "3pt made": "three pointers",
-        "pra": "pra",
-        "points + assists": "pa",
-        "points + rebounds": "pr",
-        "assists + rebounds": "ar",
-    }
-    cleaned = normalize_text(stat_name)
-    return mapping.get(cleaned, cleaned)
-
 # =========================================================
 # IMAGE / OCR HELPERS
 # =========================================================
@@ -606,6 +520,12 @@ def clean_ocr_lines(text: str) -> list[str]:
         "ovr",
         "psb",
         "woodzdabookie",
+        "straight bets",
+        "round robin",
+        "save for later",
+        "balance:$",
+        "balance: $",
+        "remove all selections",
     ]
 
     out = []
@@ -631,6 +551,47 @@ def clean_ocr_lines(text: str) -> list[str]:
         out.append(line)
 
     return out
+
+
+def is_footer_or_betslip_junk_line(line: str) -> bool:
+    lower = line.lower().strip()
+
+    footer_starts = [
+        "straight bets",
+        "round robin",
+        "accept odds movements",
+        "save for later",
+        "enter wager amount",
+        "remove all selections",
+        "wager",
+        "to win",
+        "balance:",
+        "balance $",
+        "balance:$",
+    ]
+
+    if any(lower.startswith(x) for x in footer_starts):
+        return True
+
+    if re.fullmatch(r"\$?\d+(?:\.\d+)?", lower):
+        return True
+
+    return False
+
+
+def normalize_stat(raw: str) -> str:
+    return STAT_ALIASES.get(raw.strip().lower(), raw.strip().title())
+
+
+def normalize_team(raw: str) -> str:
+    cleaned = re.sub(r"\s+", " ", raw).strip(" -")
+    lowered = cleaned.lower()
+    return TEAM_ALIASES.get(lowered, cleaned.title())
+
+
+def normalize_player(raw: str) -> str:
+    cleaned = re.sub(r"\s+", " ", raw).strip(" .-")
+    return cleaned.title()
 
 
 def leg_to_display(leg: dict) -> str:
@@ -689,7 +650,7 @@ def is_schedule_or_status_line(line: str) -> bool:
         return True
     if lower.endswith(" et") or lower == "et":
         return True
-    if "live" == lower or "finished" == lower:
+    if lower == "live" or lower == "finished":
         return True
     return False
 
@@ -698,10 +659,17 @@ def group_lines_into_blocks(lines: list[str]) -> list[list[str]]:
     blocks = []
     current = []
 
-    for line in lines:
-        stripped = line.strip()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
         if not stripped:
+            i += 1
             continue
+
+        if is_footer_or_betslip_junk_line(stripped):
+            if current:
+                blocks.append(current)
+            break
 
         starts_new = False
 
@@ -715,12 +683,16 @@ def group_lines_into_blocks(lines: list[str]) -> list[list[str]]:
             starts_new = True
         elif re.search(r"^[a-z.'\- ]+\s+(over|under)\s+\d+(\.\d+)?\s+(points|assists|rebounds|pra|pa|pr|ar|pts|ast|reb)$", stripped, re.IGNORECASE):
             starts_new = True
+        elif i + 1 < len(lines) and lines[i + 1].strip().lower() == "moneyline":
+            starts_new = True
 
         if starts_new and current:
             blocks.append(current)
             current = [stripped]
         else:
             current.append(stripped)
+
+        i += 1
 
     if current:
         blocks.append(current)
@@ -818,7 +790,13 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
     legs = []
 
     for block in blocks:
-        filtered_block = [line for line in block if not is_schedule_or_status_line(line)]
+        filtered_block = []
+        for line in block:
+            if is_footer_or_betslip_junk_line(line):
+                break
+            if not is_schedule_or_status_line(line):
+                filtered_block.append(line)
+
         if not filtered_block:
             continue
 
@@ -836,13 +814,27 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
                     if looks_like_matchup(b):
                         parsed["matchup"] = b
                         break
-            elif parsed["type"] in {"spread", "moneyline"}:
-                for b in filtered_block:
-                    if looks_like_matchup(b):
-                        parsed["matchup"] = b
-                        break
             legs.append(parsed)
             continue
+
+        if len(filtered_block) >= 2:
+            team_line = filtered_block[0]
+            market_line = filtered_block[1].strip().lower()
+
+            if market_line == "moneyline":
+                leg = {
+                    "type": "moneyline",
+                    "team": normalize_team(team_line),
+                    "raw": text,
+                }
+
+                for extra in filtered_block[2:]:
+                    if looks_like_matchup(extra):
+                        leg["matchup"] = extra
+                        break
+
+                legs.append(leg)
+                continue
 
         if len(filtered_block) >= 2:
             first = filtered_block[0]
@@ -859,19 +851,17 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
                 matchup_lines = [x for x in filtered_block[2:] if not is_schedule_or_status_line(x)]
                 if len(matchup_lines) >= 2:
                     leg["matchup"] = f"{normalize_team(matchup_lines[0])} vs {normalize_team(matchup_lines[1])}"
+                elif len(matchup_lines) == 1:
+                    leg["matchup"] = matchup_lines[0]
                 legs.append(leg)
                 continue
 
         if len(filtered_block) >= 2 and filtered_block[1].lower() == "moneyline":
-            leg = {
+            legs.append({
                 "type": "moneyline",
                 "team": normalize_team(filtered_block[0]),
                 "raw": text,
-            }
-            matchup_lines = [x for x in filtered_block[2:] if looks_like_matchup(x)]
-            if matchup_lines:
-                leg["matchup"] = matchup_lines[0]
-            legs.append(leg)
+            })
             continue
 
         m_spread = re.search(
@@ -886,9 +876,10 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
                 "line": m_spread.group(2),
                 "raw": text,
             }
-            matchup_lines = [x for x in filtered_block[2:] if looks_like_matchup(x)]
-            if matchup_lines:
-                leg["matchup"] = matchup_lines[0]
+            for extra in filtered_block[2:]:
+                if looks_like_matchup(extra):
+                    leg["matchup"] = extra
+                    break
             legs.append(leg)
             continue
 
@@ -947,424 +938,6 @@ def parse_betslip_meta(ocr_text: str) -> dict:
 
     return {"odds": odds, "leg_count": leg_count}
 
-# =========================================================
-# SHARPSPORTS HELPERS
-# =========================================================
-
-def has_sharp_sports() -> bool:
-    return bool(SHARP_SPORTS_API_KEY)
-
-
-def sharp_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Token {SHARP_SPORTS_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-
-def safe_get_nested(obj: Any, *path: str) -> Any:
-    current = obj
-    for key in path:
-        if isinstance(current, dict):
-            current = current.get(key)
-        else:
-            return None
-    return current
-
-
-def object_name_candidates(item: dict) -> List[str]:
-    values = []
-    possible_keys = [
-        "name", "title", "displayName", "abbr", "abbreviation", "key", "slug",
-        "shortName", "bookName", "provider", "id"
-    ]
-    for key in possible_keys:
-        value = item.get(key)
-        if isinstance(value, str) and value.strip():
-            values.append(value.strip())
-
-    nested_candidates = [
-        safe_get_nested(item, "book", "name"),
-        safe_get_nested(item, "book", "title"),
-        safe_get_nested(item, "team", "name"),
-        safe_get_nested(item, "player", "name"),
-        safe_get_nested(item, "market", "name"),
-        safe_get_nested(item, "metric", "name"),
-        safe_get_nested(item, "segment", "name"),
-    ]
-    for value in nested_candidates:
-        if isinstance(value, str) and value.strip():
-            values.append(value.strip())
-
-    seen = set()
-    out = []
-    for v in values:
-        key = normalize_text(v)
-        if key and key not in seen:
-            seen.add(key)
-            out.append(v)
-    return out
-
-
-def fuzzy_contains_any(haystack_values: List[str], needles: List[str]) -> bool:
-    hay = " | ".join(normalize_text(v) for v in haystack_values if v)
-    for needle in needles:
-        n = normalize_text(needle)
-        if not n:
-            continue
-        if n in hay:
-            return True
-    return False
-
-
-def extract_market_selection_id(item: dict) -> Optional[str]:
-    for key in ["id", "_id", "marketSelectionId"]:
-        value = item.get(key)
-        if value is not None:
-            return str(value)
-    return None
-
-
-def extract_market_selection_line(item: dict) -> Optional[str]:
-    candidates = [
-        item.get("line"),
-        item.get("mainLine"),
-        item.get("priceLine"),
-        item.get("spread"),
-        item.get("total"),
-        safe_get_nested(item, "marketOffer", "line"),
-        safe_get_nested(item, "position", "line"),
-    ]
-    for value in candidates:
-        if value is None:
-            continue
-        return str(value)
-    return None
-
-
-def extract_market_selection_position(item: dict) -> Optional[str]:
-    candidates = [
-        item.get("position"),
-        item.get("positionName"),
-        safe_get_nested(item, "position", "name"),
-        safe_get_nested(item, "position", "displayName"),
-        safe_get_nested(item, "team", "name"),
-        safe_get_nested(item, "player", "name"),
-    ]
-    for value in candidates:
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def extract_market_selection_metric(item: dict) -> Optional[str]:
-    candidates = [
-        item.get("metric"),
-        safe_get_nested(item, "metric", "name"),
-        safe_get_nested(item, "metric", "displayName"),
-        safe_get_nested(item, "market", "metric"),
-    ]
-    for value in candidates:
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def extract_market_selection_proposition(item: dict) -> Optional[str]:
-    candidates = [
-        item.get("proposition"),
-        safe_get_nested(item, "market", "proposition"),
-        safe_get_nested(item, "market", "name"),
-        item.get("type"),
-    ]
-    for value in candidates:
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def extract_market_selection_segment(item: dict) -> Optional[str]:
-    candidates = [
-        item.get("segment"),
-        safe_get_nested(item, "segment", "name"),
-        safe_get_nested(item, "segment", "displayName"),
-        safe_get_nested(item, "market", "segment"),
-    ]
-    for value in candidates:
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def extract_market_selection_availability(item: dict) -> Dict[str, bool]:
-    availability = item.get("betPlaceAvailability")
-    if isinstance(availability, dict):
-        return {str(k).lower(): bool(v) for k, v in availability.items()}
-    return {}
-
-
-async def sharp_get_json(session: aiohttp.ClientSession, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    url = f"{SHARP_SPORTS_BASE_URL}{path}"
-    async with session.get(url, headers=sharp_headers(), params=params or {}, timeout=SHARP_HTTP_TIMEOUT) as resp:
-        text = await resp.text()
-        if resp.status >= 400:
-            raise RuntimeError(f"SharpSports {resp.status}: {text[:300]}")
-        try:
-            return json.loads(text)
-        except Exception:
-            return {}
-
-
-async def fetch_sharp_books(session: aiohttp.ClientSession) -> List[dict]:
-    payload = await sharp_get_json(session, "/books")
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for key in ["results", "data", "items", "books"]:
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-    return []
-
-
-def match_supported_sharp_books(raw_books: List[dict]) -> Dict[str, dict]:
-    matched: Dict[str, dict] = {}
-
-    for wanted in SUPPORTED_BOOKS:
-        wanted_norm = normalize_text(wanted)
-        aliases = {wanted_norm}
-        aliases.update(SHARP_BOOK_ABBR_HINTS.get(wanted_norm, []))
-
-        for book in raw_books:
-            names = object_name_candidates(book)
-            normalized_names = {normalize_text(v) for v in names}
-            if aliases & normalized_names:
-                matched[wanted_norm] = {
-                    "raw": book,
-                    "id": str(book.get("id") or book.get("_id") or book.get("bookId") or ""),
-                    "label": next((n for n in names if normalize_text(n) == wanted_norm), names[0] if names else wanted.title()),
-                    "abbr_candidates": list(normalized_names | set(SHARP_BOOK_ABBR_HINTS.get(wanted_norm, []))),
-                }
-                break
-
-        if wanted_norm not in matched:
-            matched[wanted_norm] = {
-                "raw": {},
-                "id": "",
-                "label": wanted.title(),
-                "abbr_candidates": SHARP_BOOK_ABBR_HINTS.get(wanted_norm, []),
-            }
-
-    return matched
-
-
-def market_selection_matches_leg(item: dict, leg: dict) -> bool:
-    proposition = normalize_text(extract_market_selection_proposition(item) or "")
-    position = normalize_text(extract_market_selection_position(item) or "")
-    metric = normalize_text(extract_market_selection_metric(item) or "")
-    segment = normalize_text(extract_market_selection_segment(item) or "")
-    line_str = normalize_text(extract_market_selection_line(item) or "")
-
-    leg_type = leg.get("type")
-
-    if leg_type == "moneyline":
-        team = normalize_text(leg.get("team", ""))
-        if team and team not in position:
-            return False
-        return "moneyline" in proposition or proposition == "" or "ml" in proposition
-
-    if leg_type == "spread":
-        team = normalize_text(leg.get("team", ""))
-        if team and team not in position:
-            return False
-        if "spread" not in proposition and proposition:
-            return False
-        desired_line = normalize_text(str(leg.get("line", "")))
-        if desired_line and desired_line not in line_str:
-            return False
-        desired_segment = normalize_text(leg.get("period", ""))
-        if desired_segment and desired_segment not in segment:
-            return False
-        return True
-
-    if leg_type == "total":
-        direction = normalize_text(leg.get("direction", ""))
-        desired_line = normalize_text(str(leg.get("line", "")))
-        if direction and direction not in position and direction not in proposition:
-            return False
-        if "total" not in proposition and proposition:
-            return False
-        if desired_line and desired_line not in line_str:
-            return False
-        return True
-
-    if leg_type == "player_prop":
-        player = normalize_text(leg.get("player", ""))
-        if player and player not in position:
-            return False
-        desired_metric = canonical_metric_name(leg.get("stat"))
-        if desired_metric and desired_metric not in metric and desired_metric not in proposition:
-            return False
-        direction = normalize_text(leg.get("direction", ""))
-        comparator = leg.get("comparator")
-        if comparator == "+":
-            if "over" not in position and "over" not in proposition:
-                return False
-        elif direction and direction not in position and direction not in proposition:
-            return False
-        desired_line = normalize_text(str(leg.get("line", "")))
-        if desired_line and desired_line not in line_str:
-            return False
-        return True
-
-    return False
-
-
-def leg_to_sharp_query_params(leg: dict) -> Dict[str, str]:
-    params: Dict[str, str] = {}
-
-    if leg["type"] == "moneyline":
-        params["type"] = "straight"
-        params["proposition"] = "moneyline"
-        params["team"] = leg["team"]
-
-    elif leg["type"] == "spread":
-        params["type"] = "straight"
-        params["proposition"] = "spread"
-        params["team"] = leg["team"]
-        if leg.get("period"):
-            params["segment"] = normalize_segment(leg["period"]) or leg["period"]
-
-    elif leg["type"] == "total":
-        params["type"] = "straight"
-        params["proposition"] = "total"
-        params["position"] = leg["direction"]
-        if leg.get("matchup"):
-            m = re.split(r"\s+[@v][s]?\s+", leg["matchup"], maxsplit=1, flags=re.IGNORECASE)
-            if len(m) >= 1 and m[0].strip():
-                params["team"] = normalize_team(m[0].strip())
-
-    elif leg["type"] == "player_prop":
-        params["type"] = "prop"
-        params["player"] = leg["player"]
-        metric = canonical_metric_name(leg.get("stat"))
-        if metric:
-            params["metric"] = metric
-        direction = "Over" if leg.get("comparator") == "+" else leg.get("direction", "Over")
-        params["position"] = direction
-
-    return params
-
-
-async def find_best_market_selection_for_leg(
-    session: aiohttp.ClientSession,
-    leg: dict,
-    sharp_books: Dict[str, dict],
-) -> Optional[dict]:
-    params = leg_to_sharp_query_params(leg)
-    payload = await sharp_get_json(session, "/marketSelections", params=params)
-    items: List[dict] = []
-
-    if isinstance(payload, list):
-        items = payload
-    elif isinstance(payload, dict):
-        for key in ["results", "data", "items", "marketSelections"]:
-            value = payload.get(key)
-            if isinstance(value, list):
-                items = value
-                break
-
-    if not items:
-        return None
-
-    matched = [item for item in items if market_selection_matches_leg(item, leg)]
-    if not matched:
-        matched = items[:25]
-
-    best = None
-    best_score = -999
-
-    for item in matched:
-        score = 0
-        if market_selection_matches_leg(item, leg):
-            score += 8
-
-        availability = extract_market_selection_availability(item)
-        if availability:
-            for book_info in sharp_books.values():
-                if any(availability.get(abbr, False) for abbr in book_info.get("abbr_candidates", [])):
-                    score += 2
-                    break
-
-        desired_line = normalize_text(str(leg.get("line", "")))
-        found_line = normalize_text(extract_market_selection_line(item) or "")
-        if desired_line and found_line and desired_line == found_line:
-            score += 4
-
-        if score > best_score:
-            best = item
-            best_score = score
-
-    if not best:
-        return None
-
-    market_selection_id = extract_market_selection_id(best)
-    if not market_selection_id:
-        return None
-
-    return {
-        "marketSelectionId": market_selection_id,
-        "line": str(leg.get("line")) if leg.get("line") is not None else "",
-        "availability": extract_market_selection_availability(best),
-        "raw": best,
-    }
-
-
-async def build_sharp_betplace_links(legs: List[dict]) -> Dict[str, str]:
-    if not has_sharp_sports() or not legs:
-        return {}
-
-    timeout = aiohttp.ClientTimeout(total=SHARP_HTTP_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        raw_books = await fetch_sharp_books(session)
-        sharp_books = match_supported_sharp_books(raw_books)
-
-        found_leg_matches: List[dict] = []
-        for leg in legs:
-            try:
-                match = await find_best_market_selection_for_leg(session, leg, sharp_books)
-            except Exception:
-                match = None
-            if not match:
-                return {}
-            found_leg_matches.append(match)
-
-        book_links: Dict[str, str] = {}
-        for book_name in SUPPORTED_BOOKS[:5]:
-            info = sharp_books.get(book_name, {})
-            book_id = info.get("id", "")
-            if not book_id:
-                continue
-
-            abbr_candidates = info.get("abbr_candidates", [])
-            if not all(any(m["availability"].get(abbr, False) for abbr in abbr_candidates) for m in found_leg_matches):
-                continue
-
-            market_ids = ",".join(m["marketSelectionId"] for m in found_leg_matches)
-            lines = ",".join(m["line"] if m["line"] else "null" for m in found_leg_matches)
-
-            url = f"{SHARP_SPORTS_UI_BASE}/place/parlay/{book_id}?marketSelection={market_ids}"
-            if any(m["line"] for m in found_leg_matches):
-                url += f"&line={quote_plus(lines)}"
-
-            book_links[book_name] = url
-
-        return book_links
-
-# =========================================================
-# CARD / BOOK LINK VIEW
-# =========================================================
 
 def score_parse_confidence(book: str, legs: list[dict], meta: dict, ocr_text: str) -> tuple[int, str]:
     score = 0
@@ -1403,24 +976,18 @@ def build_book_search_query(legs: list[dict]) -> str:
 
 
 class SportsbookLinksView(discord.ui.View):
-    def __init__(self, legs: list[dict], sharp_links: Optional[Dict[str, str]] = None):
+    def __init__(self, legs: list[dict]):
         super().__init__(timeout=600)
         query = build_book_search_query(legs)
-        sharp_links = sharp_links or {}
 
         for book in SUPPORTED_BOOKS[:5]:
-            target = sharp_links.get(book)
-            if not target:
-                base = BOOK_URLS.get(book)
-                if not base:
-                    continue
-                target = f"{base}?q={quote_plus(query)}" if query else base
+            url = BOOK_URLS.get(book)
+            if not url:
+                continue
 
+            target = f"{url}?q={quote_plus(query)}" if query else url
             self.add_item(discord.ui.Button(label=book.title(), url=target))
 
-# =========================================================
-# OCR / TARGET RESOLUTION
-# =========================================================
 
 async def extract_text_from_image_url(image_url: str) -> str:
     payload = {
@@ -1677,16 +1244,6 @@ async def build_link_this_response(message: discord.Message):
         embed.add_field(name="OCR Preview", value=preview[:1024], inline=False)
         return embed, None, None, target_message
 
-    sharp_links: Dict[str, str] = {}
-    sharp_status = "fallback_only"
-    if has_sharp_sports():
-        try:
-            sharp_links = await build_sharp_betplace_links(legs)
-            sharp_status = "betplace_ready" if sharp_links else "fallback_only"
-        except Exception:
-            sharp_links = {}
-            sharp_status = "fallback_only"
-
     color = (
         discord.Color.green() if confidence_label == "high"
         else discord.Color.gold() if confidence_label == "medium"
@@ -1710,15 +1267,13 @@ async def build_link_this_response(message: discord.Message):
     if meta.get("odds"):
         embed.add_field(name="Slip Odds", value=f"{meta['odds']:+d}", inline=True)
 
-    if sharp_status == "betplace_ready":
-        quick_read = "Preloaded betslip links ready where matched."
-    elif confidence_label == "high":
-        quick_read = "Ready to shop across books."
-    elif confidence_label == "medium":
-        quick_read = "Looks solid. Double-check one or two legs before placing."
-    else:
-        quick_read = "Partial read. A tighter screenshot will help."
-
+    quick_read = (
+        "Ready to shop across books."
+        if confidence_label == "high"
+        else "Looks solid. Double-check one or two legs before placing."
+        if confidence_label == "medium"
+        else "Partial read. A tighter screenshot will help."
+    )
     embed.add_field(name="Quick Read", value=quick_read, inline=False)
 
     image_bytes = create_picktrax_card_bytes(
@@ -1732,12 +1287,9 @@ async def build_link_this_response(message: discord.Message):
 
     discord_file = discord.File(fp=image_bytes, filename="picktrax_card.png")
     embed.set_image(url="attachment://picktrax_card.png")
-    footer = "Use the buttons below to open supported books."
-    if sharp_status == "betplace_ready":
-        footer = "Use the buttons below to open preloaded books where available."
-    embed.set_footer(text=footer)
+    embed.set_footer(text="Use the buttons below to shop supported books.")
 
-    return embed, SportsbookLinksView(legs, sharp_links=sharp_links), discord_file, target_message
+    return embed, SportsbookLinksView(legs), discord_file, target_message
 
 # =========================================================
 # PICK TRACKING / RECAP HELPERS
