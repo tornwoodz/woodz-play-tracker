@@ -451,13 +451,6 @@ def clean_ocr_lines(text: str) -> list[str]:
         "bonus bet",
         "same game parlay",
         "sgp",
-        "live",
-        "finished",
-        "thu",
-        "fri",
-        "sat",
-        "sun",
-        "et",
         "professional sports bettor",
         "hit rate",
         "builders",
@@ -549,6 +542,20 @@ def detect_sportsbook(ocr_text: str) -> str:
 def looks_like_matchup(line: str) -> bool:
     lower = line.lower()
     return " v " in lower or " vs " in lower or " @ " in lower
+
+
+def is_schedule_or_status_line(line: str) -> bool:
+    lower = line.lower().strip()
+
+    if re.search(r"\b(mon|tue|wed|thu|fri|sat|sun)\b", lower):
+        return True
+    if re.search(r"\b\d{1,2}:\d{2}\s*(am|pm)\b", lower):
+        return True
+    if lower.endswith(" et") or lower == "et":
+        return True
+    if "live" == lower or "finished" == lower:
+        return True
+    return False
 
 
 def group_lines_into_blocks(lines: list[str]) -> list[list[str]]:
@@ -675,26 +682,30 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
     legs = []
 
     for block in blocks:
-        text = " | ".join(block)
+        filtered_block = [line for line in block if not is_schedule_or_status_line(line)]
+        if not filtered_block:
+            continue
+
+        text = " | ".join(filtered_block)
 
         parsed = None
-        for line in block:
+        for line in filtered_block:
             parsed = parse_single_line_leg(line)
             if parsed:
                 break
 
         if parsed:
             if parsed["type"] == "total":
-                for b in block:
+                for b in filtered_block:
                     if looks_like_matchup(b):
                         parsed["matchup"] = b
                         break
             legs.append(parsed)
             continue
 
-        if len(block) >= 2:
-            first = block[0]
-            second = block[1]
+        if len(filtered_block) >= 2:
+            first = filtered_block[0]
+            second = filtered_block[1]
 
             m_total = re.search(r"^(Over|Under)\s+(\d+(?:\.\d+)?)$", first, re.IGNORECASE)
             if m_total and ("total" in second.lower()):
@@ -704,25 +715,26 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
                     "line": m_total.group(2),
                     "raw": text,
                 }
-                if len(block) >= 4:
-                    leg["matchup"] = f"{normalize_team(block[2])} vs {normalize_team(block[3])}"
+                matchup_lines = [x for x in filtered_block[2:] if not is_schedule_or_status_line(x)]
+                if len(matchup_lines) >= 2:
+                    leg["matchup"] = f"{normalize_team(matchup_lines[0])} vs {normalize_team(matchup_lines[1])}"
                 legs.append(leg)
                 continue
 
-        if len(block) >= 2 and block[1].lower() == "moneyline":
+        if len(filtered_block) >= 2 and filtered_block[1].lower() == "moneyline":
             legs.append({
                 "type": "moneyline",
-                "team": normalize_team(block[0]),
+                "team": normalize_team(filtered_block[0]),
                 "raw": text,
             })
             continue
 
         m_spread = re.search(
             r"^([A-Za-z0-9&()\.'](?:[A-Za-z0-9&()\. '\-]*[A-Za-z0-9&()\.'])?)\s+([+-]\d+(?:\.\d+)?)$",
-            block[0],
+            filtered_block[0],
             re.IGNORECASE,
-        ) if block else None
-        if m_spread and len(block) >= 2 and "spread" in block[1].lower():
+        ) if filtered_block else None
+        if m_spread and len(filtered_block) >= 2 and "spread" in filtered_block[1].lower():
             legs.append({
                 "type": "spread",
                 "team": normalize_team(m_spread.group(1)),
@@ -731,10 +743,10 @@ def parse_grouped_blocks(blocks: list[list[str]]) -> list[dict]:
             })
             continue
 
-        if len(block) >= 3:
-            player_line = block[0]
-            line_line = block[1]
-            stat_line = block[2]
+        if len(filtered_block) >= 3:
+            player_line = filtered_block[0]
+            line_line = filtered_block[1]
+            stat_line = filtered_block[2]
 
             if re.search(r"^\d+(\.\d+)?\+$", line_line) and stat_line.lower() in {
                 "points", "assists", "rebounds", "pra", "pa", "pr", "ar", "pts", "ast", "reb"
@@ -947,82 +959,90 @@ def create_picktrax_card_bytes(
     odds: Optional[int] = None,
     leg_count: Optional[int] = None,
 ) -> io.BytesIO:
+    max_legs = min(len(legs), 6)
     width = 1400
-    row_height = 118
-    header_h = 200
-    footer_h = 110
-    max_legs = min(len(legs), 8)
+    row_height = 122
+    header_h = 180
+    footer_h = 95
     height = header_h + (row_height * max_legs) + footer_h
 
-    img = Image.new("RGB", (width, height), (10, 14, 22))
+    img = Image.new("RGB", (width, height), (9, 13, 22))
     draw = ImageDraw.Draw(img)
 
-    draw.rounded_rectangle((30, 30, width - 30, height - 30), radius=36, fill=(18, 26, 40))
-    draw.rounded_rectangle((50, 50, width - 50, 170), radius=28, fill=(15, 92, 190))
-    draw.rounded_rectangle((70, 95, 300, 150), radius=18, fill=(12, 34, 62))
+    outer_pad = 28
+    draw.rounded_rectangle(
+        (outer_pad, outer_pad, width - outer_pad, height - outer_pad),
+        radius=34,
+        fill=(17, 25, 39),
+    )
 
-    title_font = safe_font(52, bold=True)
-    sub_font = safe_font(28, bold=False)
-    chip_font = safe_font(24, bold=True)
-    row_title_font = safe_font(34, bold=True)
-    row_sub_font = safe_font(25, bold=False)
-    footer_font = safe_font(28, bold=True)
+    draw.rounded_rectangle(
+        (55, 55, width - 55, 155),
+        radius=26,
+        fill=(17, 91, 196),
+    )
 
-    draw.text((90, 72), "Pick Trax - One Click Betslip", font=title_font, fill=(255, 255, 255))
+    title_font = safe_font(50, bold=True)
+    sub_font = safe_font(26, bold=False)
+    chip_font = safe_font(22, bold=True)
+    row_main_font = safe_font(34, bold=True)
+    row_sub_font = safe_font(22, bold=False)
+    footer_font = safe_font(24, bold=False)
+
+    draw.text((85, 78), "Pick Trax - One Click Betslip", font=title_font, fill=(255, 255, 255))
 
     subtitle = f"{book.title()} • {confidence_label.title()} Confidence ({confidence_score})"
     if odds:
         subtitle += f" • {odds:+d}"
-    draw.text((90, 128), subtitle, font=sub_font, fill=(220, 235, 255))
+    draw.text((87, 124), subtitle, font=sub_font, fill=(225, 238, 255))
 
     chip_text = f"{max_legs}/{leg_count if leg_count else max_legs} Bets Found"
     chip_bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
     chip_w = chip_bbox[2] - chip_bbox[0]
-    draw.rounded_rectangle((width - chip_w - 140, 92, width - 90, 145), radius=18, fill=(8, 26, 48))
-    draw.text((width - chip_w - 115, 104), chip_text, font=chip_font, fill=(255, 255, 255))
+    chip_x1 = width - chip_w - 130
+    chip_x2 = width - 85
+    draw.rounded_rectangle((chip_x1, 92, chip_x2, 134), radius=16, fill=(11, 28, 50))
+    draw.text((chip_x1 + 16, 101), chip_text, font=chip_font, fill=(255, 255, 255))
 
-    start_y = 205
-    for idx, leg in enumerate(legs[:8], start=1):
+    start_y = 185
+    for idx, leg in enumerate(legs[:max_legs], start=1):
         y1 = start_y + ((idx - 1) * row_height)
-        y2 = y1 + row_height - 18
+        y2 = y1 + 92
 
-        fill = (16, 53, 102) if idx % 2 == 1 else (14, 43, 83)
-        draw.rounded_rectangle((75, y1, width - 75, y2), radius=22, fill=fill)
+        row_fill = (18, 61, 119) if idx % 2 else (15, 48, 95)
+        draw.rounded_rectangle((75, y1, width - 75, y2), radius=20, fill=row_fill)
 
-        draw.rounded_rectangle((95, y1 + 20, 150, y1 + 72), radius=14, fill=(9, 24, 44))
-        draw.text((114, y1 + 27), str(idx), font=row_sub_font, fill=(255, 255, 255))
+        draw.rounded_rectangle((95, y1 + 21, 145, y1 + 67), radius=13, fill=(8, 24, 43))
+        draw.text((114, y1 + 28), str(idx), font=row_sub_font, fill=(255, 255, 255))
 
         primary = leg_to_display(leg)
-        secondary = ""
+        secondary = {
+            "moneyline": "Moneyline",
+            "spread": "Spread",
+            "player_prop": "Player Prop",
+            "total": "Game Total",
+        }.get(leg.get("type", ""), "")
 
-        if leg["type"] == "moneyline":
-            secondary = "Moneyline"
-        elif leg["type"] == "spread":
-            secondary = "Spread"
-        elif leg["type"] == "player_prop":
-            secondary = "Player Prop"
-        elif leg["type"] == "total":
-            secondary = "Game Total"
-
-        text_x = 175
-        text_max_width = width - 290
-        text_y = y1 + 16
+        text_x = 170
+        max_width = width - 260
+        text_y = y1 + 14
         text_y = draw_wrapped_text(
             draw,
             primary,
-            row_title_font,
+            row_main_font,
             (255, 255, 255),
             text_x,
             text_y,
-            text_max_width,
-            line_spacing=4,
+            max_width,
+            line_spacing=3,
         )
 
         if secondary:
-            draw.text((text_x, y2 - 38), secondary, font=row_sub_font, fill=(195, 215, 240))
+            draw.text((text_x, y2 - 28), secondary, font=row_sub_font, fill=(198, 218, 243))
 
-    draw.text((90, height - 82), "Pick Trax", font=footer_font, fill=(255, 255, 255))
-    draw.text((width - 430, height - 82), "Tap buttons below to shop books", font=sub_font, fill=(190, 210, 235))
+    footer_y = height - 68
+    draw.text((85, footer_y), "Pick Trax", font=footer_font, fill=(255, 255, 255))
+    draw.text((width - 390, footer_y), "Shop books with buttons below", font=footer_font, fill=(196, 214, 236))
 
     output = io.BytesIO()
     img.save(output, format="PNG")
@@ -1057,7 +1077,7 @@ async def build_link_this_response(message: discord.Message):
     if not legs:
         preview = ocr_text[:900] if ocr_text else "No OCR text found."
         embed = discord.Embed(
-            title="🔗 Pick Trax Betslip Builder",
+            title="🔗 Pick Trax One-Click Builder",
             description="I read the screenshot, but I could not confidently parse the legs.",
             color=discord.Color.blue(),
         )
@@ -1066,8 +1086,10 @@ async def build_link_this_response(message: discord.Message):
         embed.add_field(name="OCR Preview", value=preview[:1024], inline=False)
         return embed, None, None
 
-    color = discord.Color.green() if confidence_label == "high" else (
-        discord.Color.gold() if confidence_label == "medium" else discord.Color.blue()
+    color = (
+        discord.Color.green() if confidence_label == "high"
+        else discord.Color.gold() if confidence_label == "medium"
+        else discord.Color.blue()
     )
 
     found_text = f"Found **{len(legs)}** leg(s)"
@@ -1107,7 +1129,7 @@ async def build_link_this_response(message: discord.Message):
 
     discord_file = discord.File(fp=image_bytes, filename="picktrax_card.png")
     embed.set_image(url="attachment://picktrax_card.png")
-    embed.set_footer(text="Reply to a screenshot with 'link' or mention the bot with 'link'.")
+    embed.set_footer(text="Use the buttons below to shop supported books.")
 
     return embed, SportsbookLinksView(legs), discord_file
 
@@ -1374,11 +1396,10 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
+    # Pick Trax should ONLY fire when Pick Trax is explicitly mentioned
     link_requested = should_trigger_link_builder(content)
-    image_context = await get_image_attachment_from_context(message)
-    has_image_context = image_context is not None
 
-    if message.guild and link_requested and (bot_mentioned or has_image_context):
+    if message.guild and bot_mentioned and link_requested:
         try:
             embed, view, file = await build_link_this_response(message)
             if file:
