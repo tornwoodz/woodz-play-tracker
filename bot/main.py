@@ -34,6 +34,13 @@ TRACKED_PICK_CHANNELS = {
     LIVE_BETS_CHANNEL_ID: "live",
 }
 
+TRACKED_PLAY_LABELS = {
+    "hammer": "Hammer",
+    "parlay": "Parlay",
+    "weekly": "Weekly",
+    "live": "Live",
+}
+
 WIN_SUBMISSION_CHANNELS = {
     GENERAL_CHAT_ID,
     VIP_GENERAL_CHAT_ID,
@@ -149,16 +156,26 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def blank_record() -> dict:
+    return {
+        "wins": 0,
+        "losses": 0,
+        "pushes": 0,
+        "units": 0.0,
+    }
+
+
 def default_data() -> dict:
     return {
         "owner_id": None,
         "show_dollars": False,
         "unit_value": 100.0,
-        "record": {
-            "wins": 0,
-            "losses": 0,
-            "pushes": 0,
-            "units": 0.0,
+        "record": blank_record(),
+        "channel_records": {
+            "hammer": blank_record(),
+            "parlay": blank_record(),
+            "weekly": blank_record(),
+            "live": blank_record(),
         },
         "picks": [],
         "graded_history": [],
@@ -170,6 +187,27 @@ def default_data() -> dict:
 def save_data(data: dict) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def ensure_data_shape(data: dict) -> dict:
+    defaults = default_data()
+
+    for key, value in defaults.items():
+        if key not in data:
+            data[key] = value
+
+    if not isinstance(data.get("channel_records"), dict):
+        data["channel_records"] = {}
+
+    for play_type in TRACKED_PLAY_LABELS.keys():
+        if play_type not in data["channel_records"] or not isinstance(data["channel_records"][play_type], dict):
+            data["channel_records"][play_type] = blank_record()
+
+        for k, v in blank_record().items():
+            if k not in data["channel_records"][play_type]:
+                data["channel_records"][play_type][k] = v
+
+    return data
 
 
 def load_data() -> dict:
@@ -185,11 +223,7 @@ def load_data() -> dict:
         data = default_data()
         save_data(data)
 
-    defaults = default_data()
-    for key, value in defaults.items():
-        if key not in data:
-            data[key] = value
-
+    data = ensure_data_shape(data)
     return data
 
 
@@ -338,6 +372,10 @@ def should_trigger_link_builder(content: str) -> bool:
         "won this",
         "green this",
         "red this",
+        "track this play",
+        "track this pick",
+        "set odds",
+        "set units",
     ]
 
     return not any(phrase in text for phrase in blocked_phrases)
@@ -363,6 +401,21 @@ def detect_show_record_request(text: str) -> bool:
     return any(p in t for p in patterns)
 
 
+def detect_channel_record_request(text: str) -> Optional[str]:
+    t = normalize_text(text)
+
+    if ("hammer" in t or "hammers" in t) and ("record" in t or "stats" in t):
+        return "hammer"
+    if ("parlay" in t or "parlays" in t) and ("record" in t or "stats" in t):
+        return "parlay"
+    if "weekly" in t and ("record" in t or "stats" in t):
+        return "weekly"
+    if ("live" in t or "live bets" in t) and ("record" in t or "stats" in t):
+        return "live"
+
+    return None
+
+
 def detect_who_is_owner_request(text: str) -> bool:
     t = normalize_text(text)
     patterns = ["who is owner", "who's owner", "whos owner", "show owner", "owner?"]
@@ -381,6 +434,20 @@ def detect_cash_it_request(text: str) -> bool:
 def detect_let_it_ride_request(text: str) -> bool:
     t = normalize_text(text)
     return "let it ride" in t or "ride it" in t
+
+
+def detect_track_this_play_request(text: str) -> bool:
+    t = normalize_text(text)
+    return (
+        "track this play" in t
+        or "track this pick" in t
+        or t == "track this"
+    )
+
+
+def detect_grade_this_request(text: str) -> bool:
+    t = normalize_text(text)
+    return "grade this" in t
 
 
 def get_best_member_role(member: discord.Member) -> str:
@@ -407,12 +474,29 @@ def find_pick_by_id(pick_id: int) -> Optional[dict]:
     return None
 
 
+def find_pick_by_source_message_id(message_id: int) -> Optional[dict]:
+    pick_id = data.get("message_pick_map", {}).get(str(message_id))
+    if pick_id is None:
+        return None
+    return find_pick_by_id(int(pick_id))
+
+
 def pending_picks() -> list:
     return [p for p in data["picks"] if p["status"] == "pending"]
 
 
 def graded_history() -> list:
     return data["graded_history"]
+
+
+def record_stats(record: dict) -> tuple[int, int, int, float, float]:
+    wins = int(record.get("wins", 0))
+    losses = int(record.get("losses", 0))
+    pushes = int(record.get("pushes", 0))
+    units = float(record.get("units", 0.0))
+    graded_decisions = wins + losses
+    win_rate = (wins / graded_decisions * 100) if graded_decisions > 0 else 0.0
+    return wins, losses, pushes, units, win_rate
 
 
 def build_pick_embed(pick: dict) -> discord.Embed:
@@ -424,8 +508,10 @@ def build_pick_embed(pick: dict) -> discord.Embed:
     elif pick["status"] == "push":
         color = discord.Color.light_grey()
 
+    play_label = TRACKED_PLAY_LABELS.get(pick["play_type"], pick["play_type"].title())
+
     embed = discord.Embed(
-        title=f"Pick #{pick['id']} • {pick['play_type'].title()}",
+        title=f"Pick #{pick['id']} • {play_label}",
         description=pick["bet"][:4000] if pick.get("bet") else "No description",
         color=color,
         timestamp=datetime.now(timezone.utc),
@@ -444,22 +530,49 @@ def build_pick_embed(pick: dict) -> discord.Embed:
     if pick.get("source_channel_name"):
         embed.add_field(name="Source Channel", value=pick["source_channel_name"], inline=False)
 
+    if pick.get("source_jump_url"):
+        embed.add_field(name="Source Message", value=f"[Jump to original post]({pick['source_jump_url']})", inline=False)
+
     return embed
 
 
 def build_record_embed() -> discord.Embed:
     rec = data["record"]
-    graded_decisions = rec["wins"] + rec["losses"]
-    win_rate = (rec["wins"] / graded_decisions * 100) if graded_decisions > 0 else 0.0
+    wins, losses, pushes, units, win_rate = record_stats(rec)
 
     embed = discord.Embed(
         title="📊 Official Record",
         color=discord.Color.green(),
     )
-    embed.add_field(name="Wins", value=str(rec["wins"]), inline=True)
-    embed.add_field(name="Losses", value=str(rec["losses"]), inline=True)
-    embed.add_field(name="Pushes", value=str(rec["pushes"]), inline=True)
-    embed.add_field(name="Profit", value=format_profit(rec["units"]), inline=True)
+    embed.add_field(name="Wins", value=str(wins), inline=True)
+    embed.add_field(name="Losses", value=str(losses), inline=True)
+    embed.add_field(name="Pushes", value=str(pushes), inline=True)
+    embed.add_field(name="Profit", value=format_profit(units), inline=True)
+    embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
+
+    for play_type in ["hammer", "parlay", "weekly", "live"]:
+        cw, cl, cp, cu, cwr = record_stats(data["channel_records"].get(play_type, blank_record()))
+        embed.add_field(
+            name=f"{TRACKED_PLAY_LABELS[play_type]} Record",
+            value=f"{cw}-{cl}-{cp} • {format_profit(cu)} • {cwr:.1f}%",
+            inline=False,
+        )
+    return embed
+
+
+def build_channel_record_embed(play_type: str) -> discord.Embed:
+    wins, losses, pushes, units, win_rate = record_stats(
+        data["channel_records"].get(play_type, blank_record())
+    )
+
+    embed = discord.Embed(
+        title=f"📊 {TRACKED_PLAY_LABELS.get(play_type, play_type.title())} Record",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(name="Wins", value=str(wins), inline=True)
+    embed.add_field(name="Losses", value=str(losses), inline=True)
+    embed.add_field(name="Pushes", value=str(pushes), inline=True)
+    embed.add_field(name="Profit", value=format_profit(units), inline=True)
     embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
     return embed
 
@@ -477,6 +590,14 @@ def find_target_user_for_owner(message: discord.Message) -> Optional[discord.Mem
             return message.author
 
     return None
+
+
+def is_tracked_channel(channel_id: int) -> bool:
+    return channel_id in TRACKED_PICK_CHANNELS
+
+
+def has_graphic(message: discord.Message) -> bool:
+    return len(message.attachments) > 0 or len(message.embeds) > 0
 
 # =========================================================
 # IMAGE / OCR HELPERS
@@ -992,86 +1113,87 @@ class SportsbookLinksView(discord.ui.View):
             target = f"{url}?q={quote_plus(query)}" if query else url
             self.add_item(discord.ui.Button(label=book.title(), url=target))
 
+# =========================================================
+# PICK HELPERS
+# =========================================================
 
-async def extract_text_from_image_url(image_url: str) -> str:
-    payload = {
-        "apikey": OCR_SPACE_API_KEY,
-        "url": image_url,
-        "language": "eng",
-        "isOverlayRequired": False,
-        "scale": True,
-        "OCREngine": 2,
+def build_pick_from_message(message: discord.Message, play_type: str) -> dict:
+    next_id = len(data["picks"]) + len(data["graded_history"]) + 1
+    units = extract_units_from_text(message.content)
+    odds = extract_odds_from_text(message.content)
+
+    return {
+        "id": next_id,
+        "bet": message.content[:500] if message.content else f"Graphic pick from message {message.id}",
+        "units": units,
+        "odds": odds,
+        "status": "pending",
+        "created_by": message.author.id,
+        "created_at": utc_now_iso(),
+        "graded_at": None,
+        "graded_by": None,
+        "result": None,
+        "profit_units": 0.0,
+        "play_type": play_type,
+        "channel_type": play_type,
+        "source_message_id": message.id,
+        "source_channel_id": message.channel.id,
+        "source_channel_name": f"#{message.channel.name}",
+        "source_jump_url": message.jump_url,
     }
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://api.ocr.space/parse/image",
-            data=payload,
-            timeout=45
-        ) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"OCR request failed with status {resp.status}")
-            data_resp = await resp.json(content_type=None)
 
-    if data_resp.get("IsErroredOnProcessing"):
-        msg = "; ".join(data_resp.get("ErrorMessage", []) or ["OCR processing failed"])
-        raise RuntimeError(msg)
-
-    results = data_resp.get("ParsedResults") or []
-    text = "\n".join((r.get("ParsedText") or "") for r in results)
-    return clean_ocr_text(text)
+def register_pick(pick: dict) -> dict:
+    data["picks"].append(pick)
+    data["message_pick_map"][str(pick["source_message_id"])] = pick["id"]
+    if pick["source_message_id"] not in data["registered_source_messages"]:
+        data["registered_source_messages"].append(pick["source_message_id"])
+    save_data(data)
+    return pick
 
 
-async def resolve_target_message_for_link(message: discord.Message) -> discord.Message:
-    if message.reference and message.reference.message_id:
-        try:
-            referenced = await message.channel.fetch_message(message.reference.message_id)
-            return referenced
-        except Exception:
-            pass
+def create_auto_pick_from_message(message: discord.Message, play_type: str) -> dict:
+    pick = build_pick_from_message(message, play_type)
+    return register_pick(pick)
 
-    for att in message.attachments:
-        if is_image_attachment(att):
-            return message
 
+async def add_pin_reaction(message: discord.Message) -> None:
     try:
-        async for prior in message.channel.history(limit=15, before=message.created_at):
-            if prior.author.bot:
-                continue
-            for att in prior.attachments:
-                if is_image_attachment(att):
-                    return prior
+        await message.add_reaction("📌")
     except Exception:
         pass
 
-    return message
+
+async def post_tracking_card(channel: discord.abc.Messageable, pick: dict, prefix: Optional[str] = None) -> None:
+    content = prefix or f"📌 Pick #{pick['id']} tracked and waiting to be graded."
+    await channel.send(
+        content=content,
+        embed=build_pick_embed(pick),
+        view=GradeView(pick["id"]),
+    )
 
 
-async def get_image_attachment_from_context(message: discord.Message) -> Tuple[Optional[discord.Attachment], Optional[discord.Message]]:
-    target_message = await resolve_target_message_for_link(message)
+async def ensure_pick_tracked_from_message(source_message: discord.Message, owner_id: int) -> tuple[Optional[dict], str]:
+    if not is_owner_user(owner_id):
+        return None, "Only the owner can track official picks."
 
-    for att in target_message.attachments:
-        if is_image_attachment(att):
-            return att, target_message
+    if source_message.author.bot:
+        return None, "You can only track a real source message, not a bot message."
 
-    return None, target_message
+    if source_message.channel.id not in TRACKED_PICK_CHANNELS:
+        return None, "That message is not in one of your tracked official channels."
 
+    if not has_graphic(source_message):
+        return None, "That post needs an image or embed to be tracked."
 
-async def get_forwardable_win_context(message: discord.Message) -> Tuple[list[discord.Attachment], Optional[discord.Message]]:
-    image_attachments = [att for att in message.attachments if is_image_attachment(att)]
-    if image_attachments:
-        return image_attachments, message
+    existing = find_pick_by_source_message_id(source_message.id)
+    if existing:
+        return existing, "existing"
 
-    if message.reference and message.reference.message_id:
-        try:
-            referenced = await message.channel.fetch_message(message.reference.message_id)
-            ref_images = [att for att in referenced.attachments if is_image_attachment(att)]
-            if ref_images:
-                return ref_images, referenced
-        except Exception:
-            pass
-
-    return [], None
+    play_type = TRACKED_PICK_CHANNELS[source_message.channel.id]
+    pick = create_auto_pick_from_message(source_message, play_type)
+    await add_pin_reaction(source_message)
+    return pick, "created"
 
 # =========================================================
 # VISUAL CARD RENDERING
@@ -1322,18 +1444,17 @@ async def post_recap_if_configured(guild: discord.Guild) -> None:
         return
 
     rec = data["record"]
-    graded_decisions = rec["wins"] + rec["losses"]
-    win_rate = (rec["wins"] / graded_decisions * 100) if graded_decisions > 0 else 0.0
+    wins, losses, pushes, units, win_rate = record_stats(rec)
 
     embed = discord.Embed(
         title="🧾 Current Recap",
         color=discord.Color.orange(),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Wins", value=str(rec["wins"]), inline=True)
-    embed.add_field(name="Losses", value=str(rec["losses"]), inline=True)
-    embed.add_field(name="Pushes", value=str(rec["pushes"]), inline=True)
-    embed.add_field(name="Profit", value=format_profit(rec["units"]), inline=True)
+    embed.add_field(name="Wins", value=str(wins), inline=True)
+    embed.add_field(name="Losses", value=str(losses), inline=True)
+    embed.add_field(name="Pushes", value=str(pushes), inline=True)
+    embed.add_field(name="Profit", value=format_profit(units), inline=True)
     embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
 
     try:
@@ -1353,7 +1474,7 @@ async def forward_owner_win(guild: discord.Guild, pick: dict, source_message: Op
         color=discord.Color.gold(),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Type", value=pick["play_type"].title(), inline=True)
+    embed.add_field(name="Type", value=TRACKED_PLAY_LABELS.get(pick["play_type"], pick["play_type"].title()), inline=True)
     embed.add_field(name="Units", value=f"{pick['units']:.2f}U", inline=True)
     embed.add_field(name="Odds", value=f"{pick['odds']:+d}", inline=True)
     embed.add_field(name="Profit", value=format_profit(pick["profit_units"]), inline=True)
@@ -1427,6 +1548,7 @@ def apply_grade_to_pick(pick: dict, result: str, grader_id: int) -> tuple[bool, 
 
     odds = int(pick["odds"])
     units = float(pick["units"])
+    channel_type = pick.get("channel_type") or pick.get("play_type")
 
     pick["status"] = result
     pick["result"] = result
@@ -1439,15 +1561,27 @@ def apply_grade_to_pick(pick: dict, result: str, grader_id: int) -> tuple[bool, 
         else:
             profit_units = units * (100 / abs(odds))
         data["record"]["wins"] += 1
+        if channel_type in data["channel_records"]:
+            data["channel_records"][channel_type]["wins"] += 1
     elif result == "loss":
         profit_units = -units
         data["record"]["losses"] += 1
+        if channel_type in data["channel_records"]:
+            data["channel_records"][channel_type]["losses"] += 1
     else:
         profit_units = 0.0
         data["record"]["pushes"] += 1
+        if channel_type in data["channel_records"]:
+            data["channel_records"][channel_type]["pushes"] += 1
 
     pick["profit_units"] = round(profit_units, 4)
     data["record"]["units"] = round(data["record"]["units"] + profit_units, 4)
+
+    if channel_type in data["channel_records"]:
+        data["channel_records"][channel_type]["units"] = round(
+            data["channel_records"][channel_type]["units"] + profit_units,
+            4,
+        )
 
     data["picks"] = [p for p in data["picks"] if p["status"] == "pending"]
     data["graded_history"].append(pick)
@@ -1455,39 +1589,10 @@ def apply_grade_to_pick(pick: dict, result: str, grader_id: int) -> tuple[bool, 
 
     return True, (
         f"✅ Pick #{pick['id']} graded as **{result.upper()}**\n"
-        f"Type: {pick['play_type'].title()}\n"
+        f"Type: {TRACKED_PLAY_LABELS.get(pick['play_type'], pick['play_type'].title())}\n"
         f"Units: {pick['units']:.2f}U\n"
         f"Profit: {format_profit(pick['profit_units'])}"
     )
-
-
-def create_auto_pick_from_message(message: discord.Message, play_type: str) -> dict:
-    next_id = len(data["picks"]) + len(data["graded_history"]) + 1
-    units = extract_units_from_text(message.content)
-    odds = extract_odds_from_text(message.content)
-
-    pick = {
-        "id": next_id,
-        "bet": message.content[:500] if message.content else f"Graphic pick from message {message.id}",
-        "units": units,
-        "odds": odds,
-        "status": "pending",
-        "created_by": message.author.id,
-        "created_at": utc_now_iso(),
-        "graded_at": None,
-        "graded_by": None,
-        "result": None,
-        "profit_units": 0.0,
-        "play_type": play_type,
-        "source_message_id": message.id,
-        "source_channel_name": f"#{message.channel.name}",
-    }
-
-    data["picks"].append(pick)
-    data["message_pick_map"][str(message.id)] = pick["id"]
-    data["registered_source_messages"].append(message.id)
-    save_data(data)
-    return pick
 
 # =========================================================
 # DISCORD SETUP
@@ -1536,8 +1641,9 @@ class GradeView(discord.ui.View):
         if interaction.guild:
             source_message = None
             try:
-                if pick.get("source_message_id"):
-                    source_message = await interaction.channel.fetch_message(pick["source_message_id"])
+                if pick.get("source_channel_id") and pick.get("source_message_id"):
+                    source_channel = interaction.guild.get_channel(pick["source_channel_id"]) or interaction.channel
+                    source_message = await source_channel.fetch_message(pick["source_message_id"])
             except Exception:
                 pass
 
@@ -1581,20 +1687,28 @@ async def on_message(message: discord.Message):
     lowered = content.lower()
     bot_mentioned = bot.user in message.mentions if bot.user else False
 
+    # Auto-track fresh owner picks and drop grading card
     if message.author.id == data.get("owner_id"):
-        has_graphic = len(message.attachments) > 0 or len(message.embeds) > 0
-        if message.channel.id in TRACKED_PICK_CHANNELS and has_graphic:
+        if message.channel.id in TRACKED_PICK_CHANNELS and has_graphic(message):
             if message.id not in data.get("registered_source_messages", []):
                 play_type = TRACKED_PICK_CHANNELS[message.channel.id]
-                create_auto_pick_from_message(message, play_type)
+                pick = create_auto_pick_from_message(message, play_type)
+
+                await add_pin_reaction(message)
+
                 try:
-                    await message.add_reaction("📌")
-                except Exception:
-                    pass
+                    await post_tracking_card(
+                        message.channel,
+                        pick,
+                        prefix=f"📌 Pick #{pick['id']} tracked • {TRACKED_PLAY_LABELS.get(play_type, play_type.title())}",
+                    )
+                except Exception as e:
+                    print(f"Failed posting tracking card: {e}")
 
     link_requested = should_trigger_link_builder(lowered)
     result = detect_result(lowered)
 
+    # Link builder
     if message.guild and bot_mentioned and link_requested:
         target_message = await resolve_target_message_for_link(message)
 
@@ -1629,6 +1743,7 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    # Owner reply actions on original messages
     if message.reference and bot_mentioned and message.author.id == data.get("owner_id"):
         try:
             referenced = await message.channel.fetch_message(message.reference.message_id)
@@ -1636,34 +1751,67 @@ async def on_message(message: discord.Message):
             await bot.process_commands(message)
             return
 
-        pick_id = data["message_pick_map"].get(str(referenced.id))
-        if pick_id:
-            pick = find_pick_by_id(int(pick_id))
+        pick = find_pick_by_source_message_id(referenced.id)
 
-            if pick and result in {"win", "loss", "push"}:
-                ok, msg = apply_grade_to_pick(pick, result, message.author.id)
-                if ok:
-                    await message.channel.send(msg)
-                    if message.guild:
-                        if result == "win":
-                            await forward_owner_win(message.guild, pick, referenced)
-                        await post_recap_if_configured(message.guild)
-                else:
-                    await message.channel.send(msg)
-
+        # Track old play
+        if detect_track_this_play_request(content):
+            tracked_pick, status = await ensure_pick_tracked_from_message(referenced, message.author.id)
+            if not tracked_pick:
+                await message.channel.send(status)
                 await bot.process_commands(message)
                 return
 
-            if pick and "grade this" in lowered:
+            if status == "created":
+                await message.channel.send(f"📌 Pick #{tracked_pick['id']} tracked from old post.")
+                await post_tracking_card(message.channel, tracked_pick)
+            else:
+                await message.channel.send(f"That post is already tracked as Pick #{tracked_pick['id']}.")
+            await bot.process_commands(message)
+            return
+
+        # Grade this = track first if needed, then open grading
+        if detect_grade_this_request(content):
+            if not pick:
+                tracked_pick, status = await ensure_pick_tracked_from_message(referenced, message.author.id)
+                if not tracked_pick:
+                    await message.channel.send(status)
+                    await bot.process_commands(message)
+                    return
+                pick = tracked_pick
+                if status == "created":
+                    await message.channel.send(f"📌 Pick #{pick['id']} tracked from old post and opened for grading.")
+
+            if pick["status"] != "pending":
                 await message.channel.send(
-                    f"Pick #{pick['id']} ready to grade:",
-                    embed=build_pick_embed(pick),
-                    view=GradeView(pick["id"]),
+                    f"Pick #{pick['id']} is already graded as **{pick['status'].upper()}**."
                 )
                 await bot.process_commands(message)
                 return
 
-    member_win_forwarded = False
+            await message.channel.send(
+                f"Pick #{pick['id']} ready to grade:",
+                embed=build_pick_embed(pick),
+                view=GradeView(pick["id"]),
+            )
+            await bot.process_commands(message)
+            return
+
+        # Direct win/loss/push reply on tracked pick
+        if pick and result in {"win", "loss", "push"}:
+            ok, msg = apply_grade_to_pick(pick, result, message.author.id)
+            if ok:
+                await message.channel.send(msg)
+                if message.guild:
+                    if result == "win":
+                        await forward_owner_win(message.guild, pick, referenced)
+                    await post_recap_if_configured(message.guild)
+            else:
+                await message.channel.send(msg)
+
+            await bot.process_commands(message)
+            return
+
+    # Member win forwarding
     if (
         message.guild
         and bot_mentioned
@@ -1671,9 +1819,16 @@ async def on_message(message: discord.Message):
         and isinstance(message.author, discord.Member)
         and result == "win"
     ):
-        member_win_forwarded = await forward_member_win(message)
+        await forward_member_win(message)
 
+    # Mention commands / chat-style helpers
     if message.guild and bot_mentioned:
+        channel_record_type = detect_channel_record_request(content)
+        if channel_record_type:
+            await message.reply(embed=build_channel_record_embed(channel_record_type), mention_author=False)
+            await bot.process_commands(message)
+            return
+
         if detect_ping_request(content):
             await message.reply("🏓 pong", mention_author=False)
             await bot.process_commands(message)
@@ -1755,6 +1910,20 @@ async def record(interaction: discord.Interaction):
     await interaction.response.send_message(embed=build_record_embed())
 
 
+@bot.tree.command(name="channelrecord", description="Show record for one official channel type")
+@app_commands.describe(channel_type="hammer, parlay, weekly, or live")
+@app_commands.choices(
+    channel_type=[
+        app_commands.Choice(name="hammer", value="hammer"),
+        app_commands.Choice(name="parlay", value="parlay"),
+        app_commands.Choice(name="weekly", value="weekly"),
+        app_commands.Choice(name="live", value="live"),
+    ]
+)
+async def channelrecord(interaction: discord.Interaction, channel_type: app_commands.Choice[str]):
+    await interaction.response.send_message(embed=build_channel_record_embed(channel_type.value))
+
+
 @bot.tree.command(name="pending", description="List pending official plays")
 async def pending(interaction: discord.Interaction):
     items = pending_picks()
@@ -1766,7 +1935,7 @@ async def pending(interaction: discord.Interaction):
     lines = ["📋 **Pending Picks**"]
     for idx, p in enumerate(items, start=1):
         lines.append(
-            f"{idx}. ID {p['id']} — {p['play_type'].title()} — {p['units']:.2f}U — {p['source_channel_name']}"
+            f"{idx}. ID {p['id']} — {TRACKED_PLAY_LABELS.get(p['play_type'], p['play_type'].title())} — {p['units']:.2f}U — {p['source_channel_name']}"
         )
 
     await interaction.response.send_message("\n".join(lines))
@@ -1808,8 +1977,17 @@ async def grade(interaction: discord.Interaction, index: int, result: app_comman
     await interaction.response.send_message(msg)
 
     if interaction.guild:
+        source_message = None
+        try:
+            if pick.get("source_channel_id") and pick.get("source_message_id"):
+                source_channel = interaction.guild.get_channel(pick["source_channel_id"])
+                if source_channel:
+                    source_message = await source_channel.fetch_message(pick["source_message_id"])
+        except Exception:
+            pass
+
         if result.value == "win":
-            await forward_owner_win(interaction.guild, pick, None)
+            await forward_owner_win(interaction.guild, pick, source_message)
         await post_recap_if_configured(interaction.guild)
 
 
@@ -1842,7 +2020,7 @@ async def recap(interaction: discord.Interaction, count: Optional[int] = 10):
     for p in reversed(history):
         emoji = "✅" if p["result"] == "win" else "❌" if p["result"] == "loss" else "➖"
         lines.append(
-            f"{emoji} ID {p['id']} — {p['play_type'].title()} — {p['units']:.2f}U — {format_profit(p['profit_units'])}"
+            f"{emoji} ID {p['id']} — {TRACKED_PLAY_LABELS.get(p['play_type'], p['play_type'].title())} — {p['units']:.2f}U — {format_profit(p['profit_units'])}"
         )
 
     await interaction.followup.send("\n".join(lines))
