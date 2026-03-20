@@ -37,6 +37,10 @@ TRACKED_PICK_CHANNELS = {
 WIN_SUBMISSION_CHANNELS = {
     GENERAL_CHAT_ID,
     VIP_GENERAL_CHAT_ID,
+    HAMMERS_CHANNEL_ID,
+    PARLAYS_CHANNEL_ID,
+    WEEKLY_LOCKS_CHANNEL_ID,
+    LIVE_BETS_CHANNEL_ID,
 }
 
 VIP_ROLE_NAME = "🏆VIP"
@@ -1052,6 +1056,23 @@ async def get_image_attachment_from_context(message: discord.Message) -> Tuple[O
 
     return None, target_message
 
+
+async def get_forwardable_win_context(message: discord.Message) -> Tuple[list[discord.Attachment], Optional[discord.Message]]:
+    image_attachments = [att for att in message.attachments if is_image_attachment(att)]
+    if image_attachments:
+        return image_attachments, message
+
+    if message.reference and message.reference.message_id:
+        try:
+            referenced = await message.channel.fetch_message(message.reference.message_id)
+            ref_images = [att for att in referenced.attachments if is_image_attachment(att)]
+            if ref_images:
+                return ref_images, referenced
+        except Exception:
+            pass
+
+    return [], None
+
 # =========================================================
 # VISUAL CARD RENDERING
 # =========================================================
@@ -1353,11 +1374,16 @@ async def forward_owner_win(guild: discord.Guild, pick: dict, source_message: Op
         print(f"Failed forwarding official win: {e}")
 
 
-async def forward_member_win(message: discord.Message) -> None:
+async def forward_member_win(message: discord.Message) -> bool:
     wins_channel = message.guild.get_channel(POST_YOUR_WINS_ID)
     if wins_channel is None:
         print("Could not find post-your-wins channel by ID.")
-        return
+        return False
+
+    image_attachments, source_message = await get_forwardable_win_context(message)
+    if not image_attachments:
+        print("No image attachment found on current or replied message.")
+        return False
 
     role_name = get_best_member_role(message.author)
 
@@ -1371,19 +1397,28 @@ async def forward_member_win(message: discord.Message) -> None:
     embed.add_field(name="Role", value=role_name, inline=True)
     embed.add_field(name="Source", value=message.channel.mention, inline=True)
 
+    if source_message and source_message.id != message.id:
+        embed.add_field(name="Betslip Source", value=f"[Reply Target Jump]({source_message.jump_url})", inline=False)
+
     files = []
-    for attachment in message.attachments:
+    for attachment in image_attachments:
         try:
             files.append(await attachment.to_file())
         except Exception as e:
             print(f"attachment error: {e}")
 
+    if not files:
+        print("No files were converted for forwarding.")
+        return False
+
     try:
         await wins_channel.send(embed=embed, files=files)
         await message.add_reaction("✅")
         print("Forwarded winner successfully.")
+        return True
     except Exception as e:
         print(f"Failed forwarding winner: {e}")
+        return False
 
 
 def apply_grade_to_pick(pick: dict, result: str, grader_id: int) -> tuple[bool, str]:
@@ -1557,6 +1592,87 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
+    link_requested = should_trigger_link_builder(lowered)
+    result = detect_result(lowered)
+
+    if message.guild and bot_mentioned and link_requested:
+        target_message = await resolve_target_message_for_link(message)
+
+        try:
+            await message.reply("I got you!", mention_author=False)
+        except Exception:
+            pass
+
+        if target_message:
+            for att in target_message.attachments:
+                if is_image_attachment(att):
+                    try:
+                        await target_message.add_reaction("🔗")
+                    except Exception:
+                        pass
+                    break
+
+        try:
+            embed, view, file, _ = await build_link_this_response(message)
+            if file:
+                await message.channel.send(embed=embed, view=view, file=file)
+            else:
+                await message.channel.send(embed=embed, view=view)
+        except Exception as e:
+            await message.channel.send(
+                embed=discord.Embed(
+                    title="🔗 Pick Trax Betslip Builder",
+                    description=f"Something went wrong while building the slip: {e}",
+                    color=discord.Color.red(),
+                )
+            )
+        await bot.process_commands(message)
+        return
+
+    if message.reference and bot_mentioned and message.author.id == data.get("owner_id"):
+        try:
+            referenced = await message.channel.fetch_message(message.reference.message_id)
+        except Exception:
+            await bot.process_commands(message)
+            return
+
+        pick_id = data["message_pick_map"].get(str(referenced.id))
+        if pick_id:
+            pick = find_pick_by_id(int(pick_id))
+
+            if pick and result in {"win", "loss", "push"}:
+                ok, msg = apply_grade_to_pick(pick, result, message.author.id)
+                if ok:
+                    await message.channel.send(msg)
+                    if message.guild:
+                        if result == "win":
+                            await forward_owner_win(message.guild, pick, referenced)
+                        await post_recap_if_configured(message.guild)
+                else:
+                    await message.channel.send(msg)
+
+                await bot.process_commands(message)
+                return
+
+            if pick and "grade this" in lowered:
+                await message.channel.send(
+                    f"Pick #{pick['id']} ready to grade:",
+                    embed=build_pick_embed(pick),
+                    view=GradeView(pick["id"]),
+                )
+                await bot.process_commands(message)
+                return
+
+    member_win_forwarded = False
+    if (
+        message.guild
+        and bot_mentioned
+        and message.channel.id in WIN_SUBMISSION_CHANNELS
+        and isinstance(message.author, discord.Member)
+        and result == "win"
+    ):
+        member_win_forwarded = await forward_member_win(message)
+
     if message.guild and bot_mentioned:
         if detect_ping_request(content):
             await message.reply("🏓 pong", mention_author=False)
@@ -1603,84 +1719,6 @@ async def on_message(message: discord.Message):
             await message.reply("🎯 LET IT RIDE.", mention_author=False)
             await bot.process_commands(message)
             return
-
-    link_requested = should_trigger_link_builder(lowered)
-
-    if message.guild and bot_mentioned and link_requested:
-        target_message = await resolve_target_message_for_link(message)
-
-        try:
-            await message.reply("I got you!", mention_author=False)
-        except Exception:
-            pass
-
-        if target_message:
-            for att in target_message.attachments:
-                if is_image_attachment(att):
-                    try:
-                        await target_message.add_reaction("🔗")
-                    except Exception:
-                        pass
-                    break
-
-        try:
-            embed, view, file, _ = await build_link_this_response(message)
-            if file:
-                await message.channel.send(embed=embed, view=view, file=file)
-            else:
-                await message.channel.send(embed=embed, view=view)
-        except Exception as e:
-            await message.channel.send(
-                embed=discord.Embed(
-                    title="🔗 Pick Trax Betslip Builder",
-                    description=f"Something went wrong while building the slip: {e}",
-                    color=discord.Color.red(),
-                )
-            )
-        await bot.process_commands(message)
-        return
-
-    result = detect_result(lowered)
-
-    if message.reference and bot_mentioned and message.author.id == data.get("owner_id"):
-        try:
-            referenced = await message.channel.fetch_message(message.reference.message_id)
-        except Exception:
-            await bot.process_commands(message)
-            return
-
-        pick_id = data["message_pick_map"].get(str(referenced.id))
-        if pick_id:
-            pick = find_pick_by_id(int(pick_id))
-
-            if pick and result in {"win", "loss", "push"}:
-                ok, msg = apply_grade_to_pick(pick, result, message.author.id)
-                if ok:
-                    await message.channel.send(msg)
-                    if message.guild:
-                        if result == "win":
-                            await forward_owner_win(message.guild, pick, referenced)
-                        await post_recap_if_configured(message.guild)
-                else:
-                    await message.channel.send(msg)
-
-                await bot.process_commands(message)
-                return
-
-            if pick and "grade this" in lowered:
-                await message.channel.send(
-                    f"Pick #{pick['id']} ready to grade:",
-                    embed=build_pick_embed(pick),
-                    view=GradeView(pick["id"]),
-                )
-                await bot.process_commands(message)
-                return
-
-    if message.guild and bot_mentioned:
-        if message.channel.id in WIN_SUBMISSION_CHANNELS and isinstance(message.author, discord.Member):
-            win_result = detect_result(lowered)
-            if win_result == "win":
-                await forward_member_win(message)
 
     await bot.process_commands(message)
 
