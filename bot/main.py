@@ -41,6 +41,13 @@ TRACKED_PLAY_LABELS = {
     "live": "Live",
 }
 
+CHANNEL_RECAP_TARGETS = {
+    "hammer": HAMMERS_CHANNEL_ID,
+    "parlay": PARLAYS_CHANNEL_ID,
+    "weekly": WEEKLY_LOCKS_CHANNEL_ID,
+    "live": LIVE_BETS_CHANNEL_ID,
+}
+
 WIN_SUBMISSION_CHANNELS = {
     GENERAL_CHAT_ID,
     VIP_GENERAL_CHAT_ID,
@@ -177,6 +184,13 @@ def default_data() -> dict:
             "weekly": blank_record(),
             "live": blank_record(),
         },
+        "recap_message_ids": {
+            "overall": None,
+            "hammer": None,
+            "parlay": None,
+            "weekly": None,
+            "live": None,
+        },
         "picks": [],
         "graded_history": [],
         "message_pick_map": {},
@@ -184,47 +198,51 @@ def default_data() -> dict:
     }
 
 
-def save_data(data: dict) -> None:
+def save_data(data_obj: dict) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data_obj, f, indent=2)
 
 
-def ensure_data_shape(data: dict) -> dict:
+def ensure_data_shape(data_obj: dict) -> dict:
     defaults = default_data()
-
     for key, value in defaults.items():
-        if key not in data:
-            data[key] = value
+        if key not in data_obj:
+            data_obj[key] = value
 
-    if not isinstance(data.get("channel_records"), dict):
-        data["channel_records"] = {}
+    if not isinstance(data_obj.get("channel_records"), dict):
+        data_obj["channel_records"] = {}
 
     for play_type in TRACKED_PLAY_LABELS.keys():
-        if play_type not in data["channel_records"] or not isinstance(data["channel_records"][play_type], dict):
-            data["channel_records"][play_type] = blank_record()
-
+        if play_type not in data_obj["channel_records"] or not isinstance(data_obj["channel_records"][play_type], dict):
+            data_obj["channel_records"][play_type] = blank_record()
         for k, v in blank_record().items():
-            if k not in data["channel_records"][play_type]:
-                data["channel_records"][play_type][k] = v
+            if k not in data_obj["channel_records"][play_type]:
+                data_obj["channel_records"][play_type][k] = v
 
-    return data
+    if not isinstance(data_obj.get("recap_message_ids"), dict):
+        data_obj["recap_message_ids"] = {}
+
+    for key in ["overall", "hammer", "parlay", "weekly", "live"]:
+        if key not in data_obj["recap_message_ids"]:
+            data_obj["recap_message_ids"][key] = None
+
+    return data_obj
 
 
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
-        data = default_data()
-        save_data(data)
-        return data
+        data_obj = default_data()
+        save_data(data_obj)
+        return data_obj
 
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            data_obj = json.load(f)
     except Exception:
-        data = default_data()
-        save_data(data)
+        data_obj = default_data()
+        save_data(data_obj)
 
-    data = ensure_data_shape(data)
-    return data
+    return ensure_data_shape(data_obj)
 
 
 data = load_data()
@@ -249,6 +267,16 @@ def format_profit(units: float) -> str:
         return f"{sign}${dollars:,.2f}"
     sign = "+" if units >= 0 else ""
     return f"{sign}{units:.2f}U"
+
+
+def record_stats(record: dict) -> tuple[int, int, int, float, float]:
+    wins = int(record.get("wins", 0))
+    losses = int(record.get("losses", 0))
+    pushes = int(record.get("pushes", 0))
+    units = float(record.get("units", 0.0))
+    graded_decisions = wins + losses
+    win_rate = (wins / graded_decisions * 100) if graded_decisions > 0 else 0.0
+    return wins, losses, pushes, units, win_rate
 
 
 def extract_units_from_text(text: str) -> float:
@@ -285,6 +313,38 @@ def extract_odds_from_text(text: str) -> int:
             pass
 
     return -110
+
+
+def parse_units_update(text: str) -> Optional[float]:
+    lowered = normalize_text(text)
+    patterns = [
+        r"set units?\s+([+-]?\d+(?:\.\d+)?)",
+        r"set\s+([+-]?\d+(?:\.\d+)?)\s*u\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, lowered)
+        if m:
+            try:
+                return abs(float(m.group(1)))
+            except Exception:
+                return None
+    return None
+
+
+def parse_odds_update(text: str) -> Optional[int]:
+    lowered = normalize_text(text)
+    patterns = [
+        r"set odds?\s*([+-]\d{3,4})",
+        r"\b([+-]\d{3,4})\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, lowered)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+    return None
 
 
 def detect_result(text: str) -> Optional[str]:
@@ -374,8 +434,8 @@ def should_trigger_link_builder(content: str) -> bool:
         "red this",
         "track this play",
         "track this pick",
-        "set odds",
         "set units",
+        "set odds",
     ]
 
     return not any(phrase in text for phrase in blocked_phrases)
@@ -427,6 +487,10 @@ def detect_set_owner_request(text: str) -> bool:
     return "set owner" in t or "make owner" in t or "owner is" in t
 
 
+def detect_reset_record_request(text: str) -> bool:
+    return "reset record" in normalize_text(text)
+
+
 def detect_cash_it_request(text: str) -> bool:
     return "cash it" in normalize_text(text)
 
@@ -438,16 +502,16 @@ def detect_let_it_ride_request(text: str) -> bool:
 
 def detect_track_this_play_request(text: str) -> bool:
     t = normalize_text(text)
-    return (
-        "track this play" in t
-        or "track this pick" in t
-        or t == "track this"
-    )
+    return "track this play" in t or "track this pick" in t or t == "track this"
 
 
 def detect_grade_this_request(text: str) -> bool:
+    return "grade this" in normalize_text(text)
+
+
+def detect_set_values_request(text: str) -> bool:
     t = normalize_text(text)
-    return "grade this" in t
+    return "set units" in t or "set odds" in t or re.search(r"\bset\s+\d+(\.\d+)?u\b", t) is not None
 
 
 def get_best_member_role(member: discord.Member) -> str:
@@ -489,16 +553,6 @@ def graded_history() -> list:
     return data["graded_history"]
 
 
-def record_stats(record: dict) -> tuple[int, int, int, float, float]:
-    wins = int(record.get("wins", 0))
-    losses = int(record.get("losses", 0))
-    pushes = int(record.get("pushes", 0))
-    units = float(record.get("units", 0.0))
-    graded_decisions = wins + losses
-    win_rate = (wins / graded_decisions * 100) if graded_decisions > 0 else 0.0
-    return wins, losses, pushes, units, win_rate
-
-
 def build_pick_embed(pick: dict) -> discord.Embed:
     color = discord.Color.blurple()
     if pick["status"] == "win":
@@ -536,20 +590,44 @@ def build_pick_embed(pick: dict) -> discord.Embed:
     return embed
 
 
-def build_record_embed() -> discord.Embed:
+def build_overall_record_embed() -> discord.Embed:
     rec = data["record"]
     wins, losses, pushes, units, win_rate = record_stats(rec)
 
     embed = discord.Embed(
-        title="📊 Official Record",
+        title="📊 Official Overall Record",
         color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Wins", value=str(wins), inline=True)
     embed.add_field(name="Losses", value=str(losses), inline=True)
     embed.add_field(name="Pushes", value=str(pushes), inline=True)
     embed.add_field(name="Profit", value=format_profit(units), inline=True)
     embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
+    embed.set_footer(text="This card updates automatically.")
+    return embed
 
+
+def build_channel_record_embed(play_type: str) -> discord.Embed:
+    rec = data["channel_records"].get(play_type, blank_record())
+    wins, losses, pushes, units, win_rate = record_stats(rec)
+
+    embed = discord.Embed(
+        title=f"📊 {TRACKED_PLAY_LABELS.get(play_type, play_type.title())} Record",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Wins", value=str(wins), inline=True)
+    embed.add_field(name="Losses", value=str(losses), inline=True)
+    embed.add_field(name="Pushes", value=str(pushes), inline=True)
+    embed.add_field(name="Profit", value=format_profit(units), inline=True)
+    embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
+    embed.set_footer(text="This card updates automatically.")
+    return embed
+
+
+def build_record_embed() -> discord.Embed:
+    embed = build_overall_record_embed()
     for play_type in ["hammer", "parlay", "weekly", "live"]:
         cw, cl, cp, cu, cwr = record_stats(data["channel_records"].get(play_type, blank_record()))
         embed.add_field(
@@ -557,23 +635,6 @@ def build_record_embed() -> discord.Embed:
             value=f"{cw}-{cl}-{cp} • {format_profit(cu)} • {cwr:.1f}%",
             inline=False,
         )
-    return embed
-
-
-def build_channel_record_embed(play_type: str) -> discord.Embed:
-    wins, losses, pushes, units, win_rate = record_stats(
-        data["channel_records"].get(play_type, blank_record())
-    )
-
-    embed = discord.Embed(
-        title=f"📊 {TRACKED_PLAY_LABELS.get(play_type, play_type.title())} Record",
-        color=discord.Color.blue(),
-    )
-    embed.add_field(name="Wins", value=str(wins), inline=True)
-    embed.add_field(name="Losses", value=str(losses), inline=True)
-    embed.add_field(name="Pushes", value=str(pushes), inline=True)
-    embed.add_field(name="Profit", value=format_profit(units), inline=True)
-    embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
     return embed
 
 
@@ -590,10 +651,6 @@ def find_target_user_for_owner(message: discord.Message) -> Optional[discord.Mem
             return message.author
 
     return None
-
-
-def is_tracked_channel(channel_id: int) -> bool:
-    return channel_id in TRACKED_PICK_CHANNELS
 
 
 def has_graphic(message: discord.Message) -> bool:
@@ -1114,354 +1171,71 @@ class SportsbookLinksView(discord.ui.View):
             self.add_item(discord.ui.Button(label=book.title(), url=target))
 
 # =========================================================
-# PICK HELPERS
+# RECAP CARD HELPERS
 # =========================================================
 
-def build_pick_from_message(message: discord.Message, play_type: str) -> dict:
-    next_id = len(data["picks"]) + len(data["graded_history"]) + 1
-    units = extract_units_from_text(message.content)
-    odds = extract_odds_from_text(message.content)
-
-    return {
-        "id": next_id,
-        "bet": message.content[:500] if message.content else f"Graphic pick from message {message.id}",
-        "units": units,
-        "odds": odds,
-        "status": "pending",
-        "created_by": message.author.id,
-        "created_at": utc_now_iso(),
-        "graded_at": None,
-        "graded_by": None,
-        "result": None,
-        "profit_units": 0.0,
-        "play_type": play_type,
-        "channel_type": play_type,
-        "source_message_id": message.id,
-        "source_channel_id": message.channel.id,
-        "source_channel_name": f"#{message.channel.name}",
-        "source_jump_url": message.jump_url,
-    }
-
-
-def register_pick(pick: dict) -> dict:
-    data["picks"].append(pick)
-    data["message_pick_map"][str(pick["source_message_id"])] = pick["id"]
-    if pick["source_message_id"] not in data["registered_source_messages"]:
-        data["registered_source_messages"].append(pick["source_message_id"])
-    save_data(data)
-    return pick
-
-
-def create_auto_pick_from_message(message: discord.Message, play_type: str) -> dict:
-    pick = build_pick_from_message(message, play_type)
-    return register_pick(pick)
-
-
-async def add_pin_reaction(message: discord.Message) -> None:
+async def _fetch_channel_message(channel: discord.TextChannel, message_id: Optional[int]) -> Optional[discord.Message]:
+    if not message_id:
+        return None
     try:
-        await message.add_reaction("📌")
+        return await channel.fetch_message(int(message_id))
     except Exception:
-        pass
+        return None
 
 
-async def post_tracking_card(channel: discord.abc.Messageable, pick: dict, prefix: Optional[str] = None) -> None:
-    content = prefix or f"📌 Pick #{pick['id']} tracked and waiting to be graded."
-    await channel.send(
-        content=content,
-        embed=build_pick_embed(pick),
-        view=GradeView(pick["id"]),
-    )
+async def _ensure_recap_message(
+    channel: discord.TextChannel,
+    recap_key: str,
+    embed: discord.Embed,
+    pin_message: bool = True,
+) -> None:
+    existing_id = data["recap_message_ids"].get(recap_key)
+    existing_msg = await _fetch_channel_message(channel, existing_id)
 
-
-async def ensure_pick_tracked_from_message(source_message: discord.Message, owner_id: int) -> tuple[Optional[dict], str]:
-    if not is_owner_user(owner_id):
-        return None, "Only the owner can track official picks."
-
-    if source_message.author.bot:
-        return None, "You can only track a real source message, not a bot message."
-
-    if source_message.channel.id not in TRACKED_PICK_CHANNELS:
-        return None, "That message is not in one of your tracked official channels."
-
-    if not has_graphic(source_message):
-        return None, "That post needs an image or embed to be tracked."
-
-    existing = find_pick_by_source_message_id(source_message.id)
-    if existing:
-        return existing, "existing"
-
-    play_type = TRACKED_PICK_CHANNELS[source_message.channel.id]
-    pick = create_auto_pick_from_message(source_message, play_type)
-    await add_pin_reaction(source_message)
-    return pick, "created"
-
-# =========================================================
-# VISUAL CARD RENDERING
-# =========================================================
-
-def safe_font(size: int, bold: bool = False):
-    candidates = []
-    if bold:
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-            "/Library/Fonts/Arial Bold.ttf",
-            "C:/Windows/Fonts/arialbd.ttf",
-        ]
-    else:
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-            "/Library/Fonts/Arial.ttf",
-            "C:/Windows/Fonts/arial.ttf",
-        ]
-
-    for path in candidates:
+    if existing_msg:
         try:
-            return ImageFont.truetype(path, size=size)
+            await existing_msg.edit(embed=embed, content=None)
+            return
         except Exception:
-            continue
+            pass
 
-    return ImageFont.load_default()
+    try:
+        new_msg = await channel.send(embed=embed)
+        data["recap_message_ids"][recap_key] = new_msg.id
+        save_data(data)
 
-
-def draw_wrapped_text(draw, text, font, fill, x, y, max_width, line_spacing=6):
-    words = text.split()
-    lines = []
-    current = ""
-
-    for word in words:
-        test = word if not current else f"{current} {word}"
-        bbox = draw.textbbox((0, 0), test, font=font)
-        width = bbox[2] - bbox[0]
-        if width <= max_width:
-            current = test
-        else:
-            if current:
-                lines.append(current)
-            current = word
-
-    if current:
-        lines.append(current)
-
-    for line in lines:
-        draw.text((x, y), line, font=font, fill=fill)
-        bbox = draw.textbbox((0, 0), line, font=font)
-        y += (bbox[3] - bbox[1]) + line_spacing
-
-    return y
+        if pin_message:
+            try:
+                await new_msg.pin(reason="Pick Trax live recap card")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Failed creating recap card {recap_key}: {e}")
 
 
-def create_picktrax_card_bytes(
-    legs: list[dict],
-    book: str,
-    confidence_label: str,
-    confidence_score: int,
-    odds: Optional[int] = None,
-    leg_count: Optional[int] = None,
-) -> io.BytesIO:
-    max_legs = min(len(legs), 6)
-    width = 1400
-    row_height = 122
-    header_h = 180
-    footer_h = 95
-    height = header_h + (row_height * max_legs) + footer_h
-
-    img = Image.new("RGB", (width, height), (9, 13, 22))
-    draw = ImageDraw.Draw(img)
-
-    outer_pad = 28
-    draw.rounded_rectangle(
-        (outer_pad, outer_pad, width - outer_pad, height - outer_pad),
-        radius=34,
-        fill=(17, 25, 39),
-    )
-
-    draw.rounded_rectangle(
-        (55, 55, width - 55, 155),
-        radius=26,
-        fill=(17, 91, 196),
-    )
-
-    title_font = safe_font(50, bold=True)
-    sub_font = safe_font(26, bold=False)
-    chip_font = safe_font(22, bold=True)
-    row_main_font = safe_font(34, bold=True)
-    row_sub_font = safe_font(22, bold=False)
-    footer_font = safe_font(24, bold=False)
-
-    draw.text((85, 78), "Pick Trax - One Click Betslip", font=title_font, fill=(255, 255, 255))
-
-    subtitle = f"{book.title()} • {confidence_label.title()} Confidence ({confidence_score})"
-    if odds:
-        subtitle += f" • {odds:+d}"
-    draw.text((87, 124), subtitle, font=sub_font, fill=(225, 238, 255))
-
-    chip_text = f"{max_legs}/{leg_count if leg_count else max_legs} Bets Found"
-    chip_bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
-    chip_w = chip_bbox[2] - chip_bbox[0]
-    chip_x1 = width - chip_w - 130
-    chip_x2 = width - 85
-    draw.rounded_rectangle((chip_x1, 92, chip_x2, 134), radius=16, fill=(11, 28, 50))
-    draw.text((chip_x1 + 16, 101), chip_text, font=chip_font, fill=(255, 255, 255))
-
-    start_y = 185
-    for idx, leg in enumerate(legs[:max_legs], start=1):
-        y1 = start_y + ((idx - 1) * row_height)
-        y2 = y1 + 92
-
-        row_fill = (18, 61, 119) if idx % 2 else (15, 48, 95)
-        draw.rounded_rectangle((75, y1, width - 75, y2), radius=20, fill=row_fill)
-
-        draw.rounded_rectangle((95, y1 + 21, 145, y1 + 67), radius=13, fill=(8, 24, 43))
-        draw.text((114, y1 + 28), str(idx), font=row_sub_font, fill=(255, 255, 255))
-
-        primary = leg_to_display(leg)
-        secondary = {
-            "moneyline": "Moneyline",
-            "spread": "Spread",
-            "player_prop": "Player Prop",
-            "total": "Game Total",
-        }.get(leg.get("type", ""), "")
-
-        text_x = 170
-        max_width = width - 260
-        text_y = y1 + 14
-        text_y = draw_wrapped_text(
-            draw,
-            primary,
-            row_main_font,
-            (255, 255, 255),
-            text_x,
-            text_y,
-            max_width,
-            line_spacing=3,
+async def update_recap_cards(guild: discord.Guild) -> None:
+    overall_channel = guild.get_channel(DAILY_RECAP_ID)
+    if isinstance(overall_channel, discord.TextChannel):
+        await _ensure_recap_message(
+            overall_channel,
+            "overall",
+            build_overall_record_embed(),
+            pin_message=True,
         )
 
-        if secondary:
-            draw.text((text_x, y2 - 28), secondary, font=row_sub_font, fill=(198, 218, 243))
-
-    footer_y = height - 68
-    draw.text((85, footer_y), "Pick Trax", font=footer_font, fill=(255, 255, 255))
-    draw.text((width - 390, footer_y), "Shop books with buttons below", font=footer_font, fill=(196, 214, 236))
-
-    output = io.BytesIO()
-    img.save(output, format="PNG")
-    output.seek(0)
-    return output
-
-# =========================================================
-# LINK BUILDER RESPONSE
-# =========================================================
-
-async def build_link_this_response(message: discord.Message):
-    attachment, target_message = await get_image_attachment_from_context(message)
-    if not attachment:
-        embed = discord.Embed(
-            title="🔗 Pick Trax Betslip Builder",
-            description="Attach a screenshot, or reply to a screenshot and say `link`.",
-            color=discord.Color.red(),
-        )
-        return embed, None, None, target_message
-
-    ocr_text = await extract_text_from_image_url(attachment.url)
-    book = detect_sportsbook(ocr_text)
-    meta = parse_betslip_meta(ocr_text)
-
-    if book == "fanduel":
-        legs = parse_fanduel_legs(ocr_text)
-    else:
-        legs = parse_generic_legs(ocr_text)
-
-    confidence_score, confidence_label = score_parse_confidence(book, legs, meta, ocr_text)
-
-    if not legs:
-        preview = ocr_text[:900] if ocr_text else "No OCR text found."
-        embed = discord.Embed(
-            title="🔗 Pick Trax One-Click Builder",
-            description="I read the screenshot, but I could not confidently parse the legs.",
-            color=discord.Color.blue(),
-        )
-        embed.add_field(name="Sportsbook", value=book.title(), inline=True)
-        embed.add_field(name="Confidence", value=f"{confidence_label.title()} ({confidence_score})", inline=True)
-        embed.add_field(name="OCR Preview", value=preview[:1024], inline=False)
-        return embed, None, None, target_message
-
-    color = (
-        discord.Color.green() if confidence_label == "high"
-        else discord.Color.gold() if confidence_label == "medium"
-        else discord.Color.blue()
-    )
-
-    found_text = f"Found **{len(legs)}** leg(s)"
-    if meta.get("leg_count"):
-        found_text += f" • OCR saw **{meta['leg_count']}**"
-
-    embed = discord.Embed(
-        title="🔗 Pick Trax One-Click Builder",
-        description=found_text,
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
-
-    embed.add_field(name="Sportsbook", value=book.title(), inline=True)
-    embed.add_field(name="Confidence", value=f"{confidence_label.title()} ({confidence_score})", inline=True)
-
-    if meta.get("odds"):
-        embed.add_field(name="Slip Odds", value=f"{meta['odds']:+d}", inline=True)
-
-    quick_read = (
-        "Ready to shop across books."
-        if confidence_label == "high"
-        else "Looks solid. Double-check one or two legs before placing."
-        if confidence_label == "medium"
-        else "Partial read. A tighter screenshot will help."
-    )
-    embed.add_field(name="Quick Read", value=quick_read, inline=False)
-
-    image_bytes = create_picktrax_card_bytes(
-        legs=legs,
-        book=book,
-        confidence_label=confidence_label,
-        confidence_score=confidence_score,
-        odds=meta.get("odds"),
-        leg_count=meta.get("leg_count"),
-    )
-
-    discord_file = discord.File(fp=image_bytes, filename="picktrax_card.png")
-    embed.set_image(url="attachment://picktrax_card.png")
-    embed.set_footer(text="Use the buttons below to shop supported books.")
-
-    return embed, SportsbookLinksView(legs), discord_file, target_message
+    for play_type, channel_id in CHANNEL_RECAP_TARGETS.items():
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel):
+            await _ensure_recap_message(
+                channel,
+                play_type,
+                build_channel_record_embed(play_type),
+                pin_message=True,
+            )
 
 # =========================================================
 # PICK TRACKING / RECAP HELPERS
 # =========================================================
-
-async def post_recap_if_configured(guild: discord.Guild) -> None:
-    recap_channel = guild.get_channel(DAILY_RECAP_ID)
-    if recap_channel is None:
-        return
-
-    rec = data["record"]
-    wins, losses, pushes, units, win_rate = record_stats(rec)
-
-    embed = discord.Embed(
-        title="🧾 Current Recap",
-        color=discord.Color.orange(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="Wins", value=str(wins), inline=True)
-    embed.add_field(name="Losses", value=str(losses), inline=True)
-    embed.add_field(name="Pushes", value=str(pushes), inline=True)
-    embed.add_field(name="Profit", value=format_profit(units), inline=True)
-    embed.add_field(name="Win Rate", value=f"{win_rate:.1f}%", inline=True)
-
-    try:
-        await recap_channel.send(embed=embed)
-    except Exception as e:
-        print(f"Failed to post recap: {e}")
-
 
 async def forward_owner_win(guild: discord.Guild, pick: dict, source_message: Optional[discord.Message]) -> None:
     wins_channel = guild.get_channel(POST_YOUR_WINS_ID)
@@ -1594,6 +1368,123 @@ def apply_grade_to_pick(pick: dict, result: str, grader_id: int) -> tuple[bool, 
         f"Profit: {format_profit(pick['profit_units'])}"
     )
 
+
+def build_pick_from_message(message: discord.Message, play_type: str) -> dict:
+    next_id = len(data["picks"]) + len(data["graded_history"]) + 1
+    units = extract_units_from_text(message.content)
+    odds = extract_odds_from_text(message.content)
+
+    return {
+        "id": next_id,
+        "bet": message.content[:500] if message.content else f"Graphic pick from message {message.id}",
+        "units": units,
+        "odds": odds,
+        "status": "pending",
+        "created_by": message.author.id,
+        "created_at": utc_now_iso(),
+        "graded_at": None,
+        "graded_by": None,
+        "result": None,
+        "profit_units": 0.0,
+        "play_type": play_type,
+        "channel_type": play_type,
+        "source_message_id": message.id,
+        "source_channel_id": message.channel.id,
+        "source_channel_name": f"#{message.channel.name}",
+        "source_jump_url": message.jump_url,
+    }
+
+
+def register_pick(pick: dict) -> dict:
+    data["picks"].append(pick)
+    data["message_pick_map"][str(pick["source_message_id"])] = pick["id"]
+    if pick["source_message_id"] not in data["registered_source_messages"]:
+        data["registered_source_messages"].append(pick["source_message_id"])
+    save_data(data)
+    return pick
+
+
+def create_auto_pick_from_message(message: discord.Message, play_type: str) -> dict:
+    pick = build_pick_from_message(message, play_type)
+    return register_pick(pick)
+
+
+async def add_pin_reaction(message: discord.Message) -> None:
+    try:
+        await message.add_reaction("📌")
+    except Exception:
+        pass
+
+
+async def post_tracking_card(channel: discord.abc.Messageable, pick: dict, prefix: Optional[str] = None) -> None:
+    content = prefix or f"📌 Pick #{pick['id']} tracked and waiting to be graded."
+    await channel.send(
+        content=content,
+        embed=build_pick_embed(pick),
+        view=GradeView(pick["id"]),
+    )
+
+
+async def ensure_pick_tracked_from_message(source_message: discord.Message, owner_id: int) -> tuple[Optional[dict], str]:
+    if not is_owner_user(owner_id):
+        return None, "Only the owner can track official picks."
+
+    if source_message.author.bot:
+        return None, "You can only track a real source message, not a bot message."
+
+    if source_message.channel.id not in TRACKED_PICK_CHANNELS:
+        return None, "That message is not in one of your tracked official channels."
+
+    if not has_graphic(source_message):
+        return None, "That post needs an image or embed to be tracked."
+
+    existing = find_pick_by_source_message_id(source_message.id)
+    if existing:
+        return existing, "existing"
+
+    play_type = TRACKED_PICK_CHANNELS[source_message.channel.id]
+    pick = create_auto_pick_from_message(source_message, play_type)
+    await add_pin_reaction(source_message)
+    return pick, "created"
+
+
+def reset_all_records() -> None:
+    data["record"] = blank_record()
+    data["channel_records"] = {
+        "hammer": blank_record(),
+        "parlay": blank_record(),
+        "weekly": blank_record(),
+        "live": blank_record(),
+    }
+    data["picks"] = []
+    data["graded_history"] = []
+    data["message_pick_map"] = {}
+    data["registered_source_messages"] = []
+    save_data(data)
+
+
+def update_pending_pick_values(pick: dict, units: Optional[float], odds: Optional[int]) -> tuple[bool, str]:
+    if pick["status"] != "pending":
+        return False, "You can only edit units/odds on pending picks."
+
+    changed = []
+
+    if units is not None:
+        if units <= 0:
+            return False, "Units must be greater than 0."
+        pick["units"] = round(float(units), 4)
+        changed.append(f"Units: {pick['units']:.2f}U")
+
+    if odds is not None:
+        pick["odds"] = int(odds)
+        changed.append(f"Odds: {pick['odds']:+d}")
+
+    if not changed:
+        return False, "I couldn't find units or odds to update."
+
+    save_data(data)
+    return True, " • ".join(changed)
+
 # =========================================================
 # DISCORD SETUP
 # =========================================================
@@ -1649,7 +1540,7 @@ class GradeView(discord.ui.View):
 
             if result == "win":
                 await forward_owner_win(interaction.guild, pick, source_message)
-            await post_recap_if_configured(interaction.guild)
+            await update_recap_cards(interaction.guild)
 
     @discord.ui.button(label="Win", style=discord.ButtonStyle.success, custom_id="picktrax_win")
     async def win_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1677,6 +1568,13 @@ async def on_ready():
 
     print(f"🔥 Logged in as {bot.user} ({bot.user.id})")
 
+    # Try to update recap cards in all connected guilds on startup
+    for guild in bot.guilds:
+        try:
+            await update_recap_cards(guild)
+        except Exception as e:
+            print(f"Failed updating recap cards on ready for guild {guild.id}: {e}")
+
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -1687,7 +1585,7 @@ async def on_message(message: discord.Message):
     lowered = content.lower()
     bot_mentioned = bot.user in message.mentions if bot.user else False
 
-    # Auto-track fresh owner picks and drop grading card
+    # Auto-track fresh owner picks in tracked channels
     if message.author.id == data.get("owner_id"):
         if message.channel.id in TRACKED_PICK_CHANNELS and has_graphic(message):
             if message.id not in data.get("registered_source_messages", []):
@@ -1704,6 +1602,12 @@ async def on_message(message: discord.Message):
                     )
                 except Exception as e:
                     print(f"Failed posting tracking card: {e}")
+
+                if message.guild:
+                    try:
+                        await update_recap_cards(message.guild)
+                    except Exception as e:
+                        print(f"Failed updating recap cards after auto-track: {e}")
 
     link_requested = should_trigger_link_builder(lowered)
     result = detect_result(lowered)
@@ -1753,6 +1657,43 @@ async def on_message(message: discord.Message):
 
         pick = find_pick_by_source_message_id(referenced.id)
 
+        # Reset record
+        if detect_reset_record_request(content):
+            reset_all_records()
+            await message.channel.send("🧹 Official record, channel records, and tracked plays have been reset.")
+            if message.guild:
+                await update_recap_cards(message.guild)
+            await bot.process_commands(message)
+            return
+
+        # Edit pending units / odds
+        if detect_set_values_request(content):
+            if not pick:
+                tracked_pick, status = await ensure_pick_tracked_from_message(referenced, message.author.id)
+                if not tracked_pick:
+                    await message.channel.send(status)
+                    await bot.process_commands(message)
+                    return
+                pick = tracked_pick
+                if status == "created":
+                    await message.channel.send(f"📌 Pick #{pick['id']} tracked from old post so it can be edited.")
+
+            units_update = parse_units_update(content)
+            odds_update = parse_odds_update(content)
+            ok, msg = update_pending_pick_values(pick, units_update, odds_update)
+            if not ok:
+                await message.channel.send(msg)
+                await bot.process_commands(message)
+                return
+
+            await message.channel.send(
+                f"✏️ Pick #{pick['id']} updated • {msg}",
+                embed=build_pick_embed(pick),
+                view=GradeView(pick["id"]),
+            )
+            await bot.process_commands(message)
+            return
+
         # Track old play
         if detect_track_this_play_request(content):
             tracked_pick, status = await ensure_pick_tracked_from_message(referenced, message.author.id)
@@ -1764,6 +1705,8 @@ async def on_message(message: discord.Message):
             if status == "created":
                 await message.channel.send(f"📌 Pick #{tracked_pick['id']} tracked from old post.")
                 await post_tracking_card(message.channel, tracked_pick)
+                if message.guild:
+                    await update_recap_cards(message.guild)
             else:
                 await message.channel.send(f"That post is already tracked as Pick #{tracked_pick['id']}.")
             await bot.process_commands(message)
@@ -1780,6 +1723,8 @@ async def on_message(message: discord.Message):
                 pick = tracked_pick
                 if status == "created":
                     await message.channel.send(f"📌 Pick #{pick['id']} tracked from old post and opened for grading.")
+                    if message.guild:
+                        await update_recap_cards(message.guild)
 
             if pick["status"] != "pending":
                 await message.channel.send(
@@ -1796,32 +1741,52 @@ async def on_message(message: discord.Message):
             await bot.process_commands(message)
             return
 
-        # Direct win/loss/push reply on tracked pick
-        if pick and result in {"win", "loss", "push"}:
+        # Direct official grading on tracked or auto-tracked source
+        if result in {"win", "loss", "push"}:
+            if not pick:
+                tracked_pick, status = await ensure_pick_tracked_from_message(referenced, message.author.id)
+                if not tracked_pick:
+                    await message.channel.send(status)
+                    await bot.process_commands(message)
+                    return
+                pick = tracked_pick
+                if status == "created":
+                    await message.channel.send(f"📌 Pick #{pick['id']} tracked from old post before grading.")
+
             ok, msg = apply_grade_to_pick(pick, result, message.author.id)
             if ok:
                 await message.channel.send(msg)
                 if message.guild:
                     if result == "win":
                         await forward_owner_win(message.guild, pick, referenced)
-                    await post_recap_if_configured(message.guild)
+                    await update_recap_cards(message.guild)
             else:
                 await message.channel.send(msg)
 
             await bot.process_commands(message)
             return
 
-    # Member win forwarding
+    # Mention-based owner reset without reply
+    if message.guild and bot_mentioned and message.author.id == data.get("owner_id"):
+        if detect_reset_record_request(content):
+            reset_all_records()
+            await message.channel.send("🧹 Official record, channel records, and tracked plays have been reset.")
+            await update_recap_cards(message.guild)
+            await bot.process_commands(message)
+            return
+
+    # Member win forwarding only for non-owner or non-official grading flows
     if (
         message.guild
         and bot_mentioned
         and message.channel.id in WIN_SUBMISSION_CHANNELS
         and isinstance(message.author, discord.Member)
         and result == "win"
+        and message.author.id != data.get("owner_id")
     ):
         await forward_member_win(message)
 
-    # Mention commands / chat-style helpers
+    # Mention commands / helpers
     if message.guild and bot_mentioned:
         channel_record_type = detect_channel_record_request(content)
         if channel_record_type:
@@ -1862,6 +1827,7 @@ async def on_message(message: discord.Message):
             data["owner_id"] = target_user.id
             save_data(data)
             await message.reply(f"👑 Owner set to {target_user.mention}", mention_author=False)
+            await update_recap_cards(message.guild)
             await bot.process_commands(message)
             return
 
@@ -1910,7 +1876,7 @@ async def record(interaction: discord.Interaction):
     await interaction.response.send_message(embed=build_record_embed())
 
 
-@bot.tree.command(name="channelrecord", description="Show record for one official channel type")
+@bot.tree.command(name="channelrecord", description="Show one channel record")
 @app_commands.describe(channel_type="hammer, parlay, weekly, or live")
 @app_commands.choices(
     channel_type=[
@@ -1988,7 +1954,7 @@ async def grade(interaction: discord.Interaction, index: int, result: app_comman
 
         if result.value == "win":
             await forward_owner_win(interaction.guild, pick, source_message)
-        await post_recap_if_configured(interaction.guild)
+        await update_recap_cards(interaction.guild)
 
 
 @bot.tree.command(name="recap", description="Show recap for the last N graded picks")
@@ -2046,6 +2012,16 @@ async def channelid(interaction: discord.Interaction):
         ephemeral=True,
     )
 
+
+@bot.tree.command(name="updaterecaps", description="Force refresh all recap cards")
+async def updaterecaps(interaction: discord.Interaction):
+    if data.get("owner_id") and not is_owner_user(interaction.user.id):
+        await interaction.response.send_message("Only the owner can refresh recap cards.", ephemeral=True)
+        return
+
+    await update_recap_cards(interaction.guild)
+    await interaction.response.send_message("✅ Recap cards refreshed.")
+
 # =========================================================
 # SETTINGS GROUP
 # =========================================================
@@ -2073,6 +2049,7 @@ async def settings_set_owner(interaction: discord.Interaction, user: discord.Use
     data["owner_id"] = user.id
     save_data(data)
     await interaction.response.send_message(f"👑 Owner set to {user.mention}")
+    await update_recap_cards(interaction.guild)
 
 
 @settings_group.command(name="set_unit_value", description="Set dollar value for 1 unit")
@@ -2084,6 +2061,7 @@ async def settings_set_unit_value(interaction: discord.Interaction, amount: floa
     data["unit_value"] = float(amount)
     save_data(data)
     await interaction.response.send_message(f"💵 1 unit is now set to ${amount:,.2f}")
+    await update_recap_cards(interaction.guild)
 
 
 @settings_group.command(name="toggle_dollars", description="Turn dollar display on or off")
@@ -2092,6 +2070,7 @@ async def settings_toggle_dollars(interaction: discord.Interaction, enabled: boo
     save_data(data)
     state = "On" if enabled else "Off"
     await interaction.response.send_message(f"💰 Dollar display is now {state}")
+    await update_recap_cards(interaction.guild)
 
 
 bot.tree.add_command(settings_group)
