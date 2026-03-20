@@ -2,6 +2,7 @@ import os
 import re
 import io
 import json
+import random
 import aiohttp
 import discord
 from datetime import datetime, timezone
@@ -59,6 +60,13 @@ WIN_SUBMISSION_CHANNELS = {
 
 VIP_ROLE_NAME = "🏆VIP"
 PUB_ROLE_NAME = "🆓PUB"
+
+WIN_HYPE_LINES = [
+    "‼️‼️🐓 BANG BANG CHICKEN 🐓‼️‼️",
+    "💰 CASH ITTTTT",
+    "🧹 SWEPT",
+    "🔒 LOCK CITY",
+]
 
 OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
 SUPPORTED_BOOKS = [
@@ -551,6 +559,10 @@ def pending_picks() -> list:
 
 def graded_history() -> list:
     return data["graded_history"]
+
+
+def get_random_win_hype() -> str:
+    return random.choice(WIN_HYPE_LINES)
 
 
 def build_pick_embed(pick: dict) -> discord.Embed:
@@ -1157,18 +1169,324 @@ def build_book_search_query(legs: list[dict]) -> str:
     return " | ".join(leg_to_display(leg) for leg in legs[:8])
 
 
-class SportsbookLinksView(discord.ui.View):
-    def __init__(self, legs: list[dict]):
-        super().__init__(timeout=600)
-        query = build_book_search_query(legs)
+async def extract_text_from_image_url(image_url: str) -> str:
+    payload = {
+        "apikey": OCR_SPACE_API_KEY,
+        "url": image_url,
+        "language": "eng",
+        "isOverlayRequired": False,
+        "scale": True,
+        "OCREngine": 2,
+    }
 
-        for book in SUPPORTED_BOOKS[:5]:
-            url = BOOK_URLS.get(book)
-            if not url:
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.ocr.space/parse/image",
+            data=payload,
+            timeout=45
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"OCR request failed with status {resp.status}")
+            data_resp = await resp.json(content_type=None)
+
+    if data_resp.get("IsErroredOnProcessing"):
+        msg = "; ".join(data_resp.get("ErrorMessage", []) or ["OCR processing failed"])
+        raise RuntimeError(msg)
+
+    results = data_resp.get("ParsedResults") or []
+    text = "\n".join((r.get("ParsedText") or "") for r in results)
+    return clean_ocr_text(text)
+
+
+async def resolve_target_message_for_link(message: discord.Message) -> discord.Message:
+    if message.reference and message.reference.message_id:
+        try:
+            referenced = await message.channel.fetch_message(message.reference.message_id)
+            return referenced
+        except Exception:
+            pass
+
+    for att in message.attachments:
+        if is_image_attachment(att):
+            return message
+
+    try:
+        async for prior in message.channel.history(limit=15, before=message.created_at):
+            if prior.author.bot:
                 continue
+            for att in prior.attachments:
+                if is_image_attachment(att):
+                    return prior
+    except Exception:
+        pass
 
-            target = f"{url}?q={quote_plus(query)}" if query else url
-            self.add_item(discord.ui.Button(label=book.title(), url=target))
+    return message
+
+
+async def get_image_attachment_from_context(message: discord.Message) -> Tuple[Optional[discord.Attachment], Optional[discord.Message]]:
+    target_message = await resolve_target_message_for_link(message)
+
+    for att in target_message.attachments:
+        if is_image_attachment(att):
+            return att, target_message
+
+    return None, target_message
+
+
+async def get_forwardable_win_context(message: discord.Message) -> Tuple[list[discord.Attachment], Optional[discord.Message]]:
+    image_attachments = [att for att in message.attachments if is_image_attachment(att)]
+    if image_attachments:
+        return image_attachments, message
+
+    if message.reference and message.reference.message_id:
+        try:
+            referenced = await message.channel.fetch_message(message.reference.message_id)
+            ref_images = [att for att in referenced.attachments if is_image_attachment(att)]
+            if ref_images:
+                return ref_images, referenced
+        except Exception:
+            pass
+
+    return [], None
+
+# =========================================================
+# VISUAL CARD RENDERING
+# =========================================================
+
+def safe_font(size: int, bold: bool = False):
+    candidates = []
+    if bold:
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+        ]
+    else:
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except Exception:
+            continue
+
+    return ImageFont.load_default()
+
+
+def draw_wrapped_text(draw, text, font, fill, x, y, max_width, line_spacing=6):
+    words = text.split()
+    lines = []
+    current = ""
+
+    for word in words:
+        test = word if not current else f"{current} {word}"
+        bbox = draw.textbbox((0, 0), test, font=font)
+        width = bbox[2] - bbox[0]
+        if width <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    for line in lines:
+        draw.text((x, y), line, font=font, fill=fill)
+        bbox = draw.textbbox((0, 0), line, font=font)
+        y += (bbox[3] - bbox[1]) + line_spacing
+
+    return y
+
+
+def create_picktrax_card_bytes(
+    legs: list[dict],
+    book: str,
+    confidence_label: str,
+    confidence_score: int,
+    odds: Optional[int] = None,
+    leg_count: Optional[int] = None,
+) -> io.BytesIO:
+    max_legs = min(len(legs), 6)
+    width = 1400
+    row_height = 122
+    header_h = 180
+    footer_h = 95
+    height = header_h + (row_height * max_legs) + footer_h
+
+    img = Image.new("RGB", (width, height), (9, 13, 22))
+    draw = ImageDraw.Draw(img)
+
+    outer_pad = 28
+    draw.rounded_rectangle(
+        (outer_pad, outer_pad, width - outer_pad, height - outer_pad),
+        radius=34,
+        fill=(17, 25, 39),
+    )
+
+    draw.rounded_rectangle(
+        (55, 55, width - 55, 155),
+        radius=26,
+        fill=(17, 91, 196),
+    )
+
+    title_font = safe_font(50, bold=True)
+    sub_font = safe_font(26, bold=False)
+    chip_font = safe_font(22, bold=True)
+    row_main_font = safe_font(34, bold=True)
+    row_sub_font = safe_font(22, bold=False)
+    footer_font = safe_font(24, bold=False)
+
+    draw.text((85, 78), "Pick Trax - One Click Betslip", font=title_font, fill=(255, 255, 255))
+
+    subtitle = f"{book.title()} • {confidence_label.title()} Confidence ({confidence_score})"
+    if odds:
+        subtitle += f" • {odds:+d}"
+    draw.text((87, 124), subtitle, font=sub_font, fill=(225, 238, 255))
+
+    chip_text = f"{max_legs}/{leg_count if leg_count else max_legs} Bets Found"
+    chip_bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
+    chip_w = chip_bbox[2] - chip_bbox[0]
+    chip_x1 = width - chip_w - 130
+    chip_x2 = width - 85
+    draw.rounded_rectangle((chip_x1, 92, chip_x2, 134), radius=16, fill=(11, 28, 50))
+    draw.text((chip_x1 + 16, 101), chip_text, font=chip_font, fill=(255, 255, 255))
+
+    start_y = 185
+    for idx, leg in enumerate(legs[:max_legs], start=1):
+        y1 = start_y + ((idx - 1) * row_height)
+        y2 = y1 + 92
+
+        row_fill = (18, 61, 119) if idx % 2 else (15, 48, 95)
+        draw.rounded_rectangle((75, y1, width - 75, y2), radius=20, fill=row_fill)
+
+        draw.rounded_rectangle((95, y1 + 21, 145, y1 + 67), radius=13, fill=(8, 24, 43))
+        draw.text((114, y1 + 28), str(idx), font=row_sub_font, fill=(255, 255, 255))
+
+        primary = leg_to_display(leg)
+        secondary = {
+            "moneyline": "Moneyline",
+            "spread": "Spread",
+            "player_prop": "Player Prop",
+            "total": "Game Total",
+        }.get(leg.get("type", ""), "")
+
+        text_x = 170
+        max_width = width - 260
+        text_y = y1 + 14
+        text_y = draw_wrapped_text(
+            draw,
+            primary,
+            row_main_font,
+            (255, 255, 255),
+            text_x,
+            text_y,
+            max_width,
+            line_spacing=3,
+        )
+
+        if secondary:
+            draw.text((text_x, y2 - 28), secondary, font=row_sub_font, fill=(198, 218, 243))
+
+    footer_y = height - 68
+    draw.text((85, footer_y), "Pick Trax", font=footer_font, fill=(255, 255, 255))
+    draw.text((width - 390, footer_y), "Shop books with buttons below", font=footer_font, fill=(196, 214, 236))
+
+    output = io.BytesIO()
+    img.save(output, format="PNG")
+    output.seek(0)
+    return output
+
+# =========================================================
+# LINK BUILDER RESPONSE
+# =========================================================
+
+async def build_link_this_response(message: discord.Message):
+    attachment, target_message = await get_image_attachment_from_context(message)
+    if not attachment:
+        embed = discord.Embed(
+            title="🔗 Pick Trax Betslip Builder",
+            description="Attach a screenshot, or reply to a screenshot and say `link`.",
+            color=discord.Color.red(),
+        )
+        return embed, None, None, target_message
+
+    ocr_text = await extract_text_from_image_url(attachment.url)
+    book = detect_sportsbook(ocr_text)
+    meta = parse_betslip_meta(ocr_text)
+
+    if book == "fanduel":
+        legs = parse_fanduel_legs(ocr_text)
+    else:
+        legs = parse_generic_legs(ocr_text)
+
+    confidence_score, confidence_label = score_parse_confidence(book, legs, meta, ocr_text)
+
+    if not legs:
+        preview = ocr_text[:900] if ocr_text else "No OCR text found."
+        embed = discord.Embed(
+            title="🔗 Pick Trax One-Click Builder",
+            description="I read the screenshot, but I could not confidently parse the legs.",
+            color=discord.Color.blue(),
+        )
+        embed.add_field(name="Sportsbook", value=book.title(), inline=True)
+        embed.add_field(name="Confidence", value=f"{confidence_label.title()} ({confidence_score})", inline=True)
+        embed.add_field(name="OCR Preview", value=preview[:1024], inline=False)
+        return embed, None, None, target_message
+
+    color = (
+        discord.Color.green() if confidence_label == "high"
+        else discord.Color.gold() if confidence_label == "medium"
+        else discord.Color.blue()
+    )
+
+    found_text = f"Found **{len(legs)}** leg(s)"
+    if meta.get("leg_count"):
+        found_text += f" • OCR saw **{meta['leg_count']}**"
+
+    embed = discord.Embed(
+        title="🔗 Pick Trax One-Click Builder",
+        description=found_text,
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    embed.add_field(name="Sportsbook", value=book.title(), inline=True)
+    embed.add_field(name="Confidence", value=f"{confidence_label.title()} ({confidence_score})", inline=True)
+
+    if meta.get("odds"):
+        embed.add_field(name="Slip Odds", value=f"{meta['odds']:+d}", inline=True)
+
+    quick_read = (
+        "Ready to shop across books."
+        if confidence_label == "high"
+        else "Looks solid. Double-check one or two legs before placing."
+        if confidence_label == "medium"
+        else "Partial read. A tighter screenshot will help."
+    )
+    embed.add_field(name="Quick Read", value=quick_read, inline=False)
+
+    image_bytes = create_picktrax_card_bytes(
+        legs=legs,
+        book=book,
+        confidence_label=confidence_label,
+        confidence_score=confidence_score,
+        odds=meta.get("odds"),
+        leg_count=meta.get("leg_count"),
+    )
+
+    discord_file = discord.File(fp=image_bytes, filename="picktrax_card.png")
+    embed.set_image(url="attachment://picktrax_card.png")
+    embed.set_footer(text="Use the buttons below to shop supported books.")
+
+    return embed, SportsbookLinksView(legs), discord_file, target_message
 
 # =========================================================
 # RECAP CARD HELPERS
@@ -1242,12 +1560,16 @@ async def forward_owner_win(guild: discord.Guild, pick: dict, source_message: Op
     if wins_channel is None:
         return
 
+    owner_id = data.get("owner_id")
+    capper_text = f"<@{owner_id}>" if owner_id else "Official Pick Trax Capper"
+
     embed = discord.Embed(
         title="🏆 Official Win",
         description=pick["bet"][:4000],
         color=discord.Color.gold(),
         timestamp=datetime.now(timezone.utc),
     )
+    embed.add_field(name="Capper", value=capper_text, inline=True)
     embed.add_field(name="Type", value=TRACKED_PLAY_LABELS.get(pick["play_type"], pick["play_type"].title()), inline=True)
     embed.add_field(name="Units", value=f"{pick['units']:.2f}U", inline=True)
     embed.add_field(name="Odds", value=f"{pick['odds']:+d}", inline=True)
@@ -1527,7 +1849,6 @@ class GradeView(discord.ui.View):
 
         embed = build_pick_embed(pick)
         await interaction.response.edit_message(embed=embed, view=None)
-        await interaction.followup.send(msg)
 
         if interaction.guild:
             source_message = None
@@ -1540,7 +1861,11 @@ class GradeView(discord.ui.View):
 
             if result == "win":
                 await forward_owner_win(interaction.guild, pick, source_message)
+
             await update_recap_cards(interaction.guild)
+
+        if result == "win":
+            await interaction.followup.send(get_random_win_hype())
 
     @discord.ui.button(label="Win", style=discord.ButtonStyle.success, custom_id="picktrax_win")
     async def win_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1568,7 +1893,6 @@ async def on_ready():
 
     print(f"🔥 Logged in as {bot.user} ({bot.user.id})")
 
-    # Try to update recap cards in all connected guilds on startup
     for guild in bot.guilds:
         try:
             await update_recap_cards(guild)
@@ -1755,7 +2079,11 @@ async def on_message(message: discord.Message):
 
             ok, msg = apply_grade_to_pick(pick, result, message.author.id)
             if ok:
-                await message.channel.send(msg)
+                if result == "win":
+                    await message.channel.send(get_random_win_hype())
+                else:
+                    await message.channel.send(msg)
+
                 if message.guild:
                     if result == "win":
                         await forward_owner_win(message.guild, pick, referenced)
@@ -1940,7 +2268,10 @@ async def grade(interaction: discord.Interaction, index: int, result: app_comman
         await interaction.response.send_message(msg)
         return
 
-    await interaction.response.send_message(msg)
+    if result.value == "win":
+        await interaction.response.send_message(get_random_win_hype())
+    else:
+        await interaction.response.send_message(msg)
 
     if interaction.guild:
         source_message = None
