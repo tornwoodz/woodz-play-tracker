@@ -44,6 +44,7 @@ TRACKED_PLAY_LABELS = {
     "weekly": "Weekly",
     "live": "Live",
     "test": "Test",
+    "manual": "Manual",
 }
 
 CHANNEL_RECAP_TARGETS = {
@@ -70,6 +71,27 @@ WIN_HYPE_MESSAGES = [
     "💰 CASH ITTTTT",
     "🧹 SWEPT",
     "🔒 LOCK CITY",
+]
+
+MEMBER_WIN_FORWARD_PHRASES = [
+    "cash it",
+    "cash this",
+    "cashed",
+    "cashed this",
+    "this cashed",
+    "bang",
+    "banged",
+    "this banged",
+    "green",
+    "green this",
+    "winner",
+    "won this",
+    "this hit",
+    "it hit",
+    "we hit",
+    "hit this",
+    "smacked",
+    "swept",
 ]
 
 OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
@@ -238,6 +260,18 @@ def ensure_data_shape(data_obj: dict) -> dict:
         if key not in data_obj["recap_message_ids"]:
             data_obj["recap_message_ids"][key] = None
 
+    if not isinstance(data_obj.get("picks"), list):
+        data_obj["picks"] = []
+
+    if not isinstance(data_obj.get("graded_history"), list):
+        data_obj["graded_history"] = []
+
+    if not isinstance(data_obj.get("message_pick_map"), dict):
+        data_obj["message_pick_map"] = {}
+
+    if not isinstance(data_obj.get("registered_source_messages"), list):
+        data_obj["registered_source_messages"] = []
+
     return data_obj
 
 
@@ -345,6 +379,7 @@ def parse_units_update(text: str) -> Optional[float]:
         r"set units?\s+([+-]?\d+(?:\.\d+)?)",
         r"set\s+([+-]?\d+(?:\.\d+)?)\s*u\b",
         r"\bset\s+([+-]?\d+(?:\.\d+)?)\b",
+        r"\bunits?\s+([+-]?\d+(?:\.\d+)?)\b",
     ]
     for pattern in patterns:
         m = re.search(pattern, lowered)
@@ -360,6 +395,7 @@ def parse_odds_update(text: str) -> Optional[int]:
     lowered = normalize_text(text)
     patterns = [
         r"set odds?\s*([+-]\d{3,4})",
+        r"\bodds?\s*([+-]\d{3,4})",
         r"\b([+-]\d{3,4})\b",
     ]
     for pattern in patterns:
@@ -398,6 +434,7 @@ def detect_result(text: str) -> Optional[str]:
         "we hit",
         "it hit",
         "banged",
+        "bang",
         "banged this",
         "cashed this",
         "this cashed",
@@ -539,6 +576,41 @@ def detect_set_values_request(text: str) -> bool:
     return "set units" in t or "set odds" in t or re.search(r"\bset\s+\d+(\.\d+)?u\b", t) is not None
 
 
+def detect_show_tracked_plays_request(text: str) -> bool:
+    t = normalize_text(text)
+    phrases = [
+        "show tracked plays",
+        "tracked plays",
+        "show picks",
+        "show tracked picks",
+        "show all tracked plays",
+    ]
+    return any(p in t for p in phrases)
+
+
+def detect_remove_play_request(text: str) -> Optional[int]:
+    t = normalize_text(text)
+    patterns = [
+        r"remove play\s+#?(\d+)",
+        r"delete play\s+#?(\d+)",
+        r"untrack play\s+#?(\d+)",
+        r"remove tracked play\s+#?(\d+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, t)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+    return None
+
+
+def is_member_win_forward_request(text: str) -> bool:
+    t = normalize_text(text)
+    return any(phrase in t for phrase in MEMBER_WIN_FORWARD_PHRASES)
+
+
 def get_best_member_role(member: discord.Member) -> str:
     role_names = {role.name for role in member.roles}
 
@@ -663,6 +735,44 @@ def build_record_embed() -> discord.Embed:
     return embed
 
 
+def build_tracked_plays_embed(include_graded: bool = False) -> discord.Embed:
+    active = sorted(data.get("picks", []), key=lambda p: p.get("id", 0))
+    graded = sorted(data.get("graded_history", []), key=lambda p: p.get("id", 0), reverse=True)[:10]
+
+    embed = discord.Embed(
+        title="📌 Tracked Plays",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    if active:
+        lines = []
+        for p in active[:25]:
+            lines.append(
+                f"#{p['id']} • {TRACKED_PLAY_LABELS.get(p['play_type'], p['play_type'].title())} • "
+                f"{p['status'].upper()} • {p['units']:.2f}U • {p['odds']:+d} • "
+                f"{p.get('source_channel_name', 'unknown')}"
+            )
+        embed.add_field(name="Pending / Active", value="\n".join(lines)[:1024], inline=False)
+    else:
+        embed.add_field(name="Pending / Active", value="None", inline=False)
+
+    if include_graded:
+        if graded:
+            lines = []
+            for p in graded:
+                lines.append(
+                    f"#{p['id']} • {TRACKED_PLAY_LABELS.get(p['play_type'], p['play_type'].title())} • "
+                    f"{p['status'].upper()} • {format_profit(float(p.get('profit_units', 0.0)))}"
+                )
+            embed.add_field(name="Recent Graded", value="\n".join(lines)[:1024], inline=False)
+        else:
+            embed.add_field(name="Recent Graded", value="None", inline=False)
+
+    embed.set_footer(text="Use /removeplay or /editplay with the play ID.")
+    return embed
+
+
 def find_target_user_for_owner(message: discord.Message) -> Optional[discord.Member]:
     others = [m for m in message.mentions if bot.user is None or m.id != bot.user.id]
     if others:
@@ -689,6 +799,40 @@ def is_image_attachment(att: discord.Attachment) -> bool:
     ct = (att.content_type or "").lower()
     name = (att.filename or "").lower()
     return ct.startswith("image/") or name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+
+
+async def ocr_image_attachment(att: discord.Attachment) -> str:
+    if not is_image_attachment(att):
+        return ""
+
+    try:
+        raw = await att.read()
+    except Exception:
+        return ""
+
+    form = aiohttp.FormData()
+    form.add_field("apikey", OCR_SPACE_API_KEY)
+    form.add_field("language", "eng")
+    form.add_field("isOverlayRequired", "false")
+    form.add_field("OCREngine", "2")
+    form.add_field("file", raw, filename=att.filename or "image.png", content_type=att.content_type or "image/png")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://api.ocr.space/parse/image", data=form, timeout=60) as resp:
+                if resp.status != 200:
+                    return ""
+                payload = await resp.json()
+    except Exception:
+        return ""
+
+    parsed = payload.get("ParsedResults") or []
+    out = []
+    for item in parsed:
+        text = item.get("ParsedText")
+        if text:
+            out.append(text)
+    return "\n".join(out).strip()
 
 
 def clean_ocr_text(text: str) -> str:
@@ -1196,6 +1340,108 @@ class SportsbookLinksView(discord.ui.View):
             self.add_item(discord.ui.Button(label=book.title(), url=target))
 
 # =========================================================
+# LINK / WIN CONTEXT HELPERS
+# =========================================================
+
+async def resolve_target_message_for_link(message: discord.Message) -> Optional[discord.Message]:
+    if message.reference and message.reference.message_id:
+        try:
+            if message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
+                return message.reference.resolved
+            return await message.channel.fetch_message(message.reference.message_id)
+        except Exception:
+            return None
+    return message
+
+
+async def get_forwardable_win_context(message: discord.Message) -> tuple[list[discord.Attachment], Optional[discord.Message]]:
+    current_images = [a for a in message.attachments if is_image_attachment(a)]
+    if current_images:
+        return current_images, message
+
+    if message.reference and message.reference.message_id:
+        try:
+            if message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
+                source = message.reference.resolved
+            else:
+                source = await message.channel.fetch_message(message.reference.message_id)
+            source_images = [a for a in source.attachments if is_image_attachment(a)]
+            if source_images:
+                return source_images, source
+        except Exception:
+            pass
+
+    return [], None
+
+
+async def build_link_this_response(message: discord.Message) -> tuple[discord.Embed, Optional[discord.ui.View], Optional[discord.File], dict]:
+    target_message = await resolve_target_message_for_link(message)
+    if target_message is None:
+        return (
+            discord.Embed(
+                title="🔗 Pick Trax Betslip Builder",
+                description="Reply to a betslip image or attach one when you say `link`.",
+                color=discord.Color.red(),
+            ),
+            None,
+            None,
+            {},
+        )
+
+    image_attachments = [a for a in target_message.attachments if is_image_attachment(a)]
+    if not image_attachments:
+        return (
+            discord.Embed(
+                title="🔗 Pick Trax Betslip Builder",
+                description="I couldn't find an image on that message.",
+                color=discord.Color.red(),
+            ),
+            None,
+            None,
+            {},
+        )
+
+    att = image_attachments[0]
+    ocr_text = await ocr_image_attachment(att)
+    cleaned = clean_ocr_text(ocr_text)
+
+    book = detect_sportsbook(cleaned)
+    meta = parse_betslip_meta(cleaned)
+    if book == "fanduel":
+        legs = parse_fanduel_legs(cleaned)
+    else:
+        legs = parse_generic_legs(cleaned)
+
+    score, confidence = score_parse_confidence(book, legs, meta, cleaned)
+
+    desc_lines = []
+    if legs:
+        for idx, leg in enumerate(legs[:12], start=1):
+            desc_lines.append(f"{idx}. {leg_to_display(leg)}")
+    else:
+        desc_lines.append("I couldn't confidently parse the legs from this slip.")
+
+    if meta.get("odds"):
+        desc_lines.append(f"\nOdds detected: {int(meta['odds']):+d}")
+    if meta.get("leg_count"):
+        desc_lines.append(f"Leg count detected: {meta['leg_count']}")
+    desc_lines.append(f"Sportsbook: {book.title() if book != 'unknown' else 'Unknown'}")
+    desc_lines.append(f"Confidence: {confidence.upper()} ({score})")
+
+    embed = discord.Embed(
+        title="🔗 Pick Trax Betslip Builder",
+        description="\n".join(desc_lines)[:4000],
+        color=discord.Color.green() if legs else discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    if target_message.jump_url:
+        embed.add_field(name="Source", value=f"[Jump to slip]({target_message.jump_url})", inline=False)
+
+    view = SportsbookLinksView(legs) if legs else None
+    return embed, view, None, {"book": book, "legs": legs, "meta": meta, "ocr_text": cleaned}
+
+# =========================================================
 # RECAP CARD HELPERS
 # =========================================================
 
@@ -1267,10 +1513,7 @@ async def _ensure_recap_message(
     title = embed.title or ""
     existing_id = data["recap_message_ids"].get(recap_key)
 
-    # First try stored message id
     existing_msg = await _fetch_channel_message(channel, existing_id)
-
-    # Clean duplicates and prefer stored msg if still valid
     cleaned_keeper = await _cleanup_duplicate_recap_messages(channel, title, existing_id)
     if cleaned_keeper is not None:
         existing_msg = cleaned_keeper
@@ -1302,7 +1545,6 @@ async def _ensure_recap_message(
             except Exception:
                 pass
 
-        # one more cleanup pass so only one survives
         keeper = await _cleanup_duplicate_recap_messages(channel, title, new_msg.id)
         if keeper:
             data["recap_message_ids"][recap_key] = keeper.id
@@ -1595,6 +1837,36 @@ def update_pending_pick_values(pick: dict, units: Optional[float], odds: Optiona
     save_data(data)
     return True, " • ".join(changed)
 
+
+def remove_pick_by_id(pick_id: int) -> tuple[bool, str]:
+    pending = data.get("picks", [])
+    graded = data.get("graded_history", [])
+
+    pending_match = next((p for p in pending if p["id"] == pick_id), None)
+    if pending_match:
+        data["picks"] = [p for p in pending if p["id"] != pick_id]
+        source_message_id = str(pending_match.get("source_message_id"))
+        if source_message_id in data.get("message_pick_map", {}):
+            data["message_pick_map"].pop(source_message_id, None)
+        try:
+            sid = int(source_message_id)
+            data["registered_source_messages"] = [x for x in data.get("registered_source_messages", []) if int(x) != sid]
+        except Exception:
+            pass
+        save_data(data)
+        return True, f"🗑️ Removed pending Pick #{pick_id}."
+
+    graded_match = next((p for p in graded if p["id"] == pick_id), None)
+    if graded_match:
+        return False, "You can only remove pending/untracked mistakes with remove. Graded plays should not be deleted casually."
+
+    return False, f"Pick #{pick_id} was not found in pending tracked plays."
+
+
+def owner_only_check(user_id: int) -> bool:
+    owner_id = data.get("owner_id")
+    return owner_id is None or user_id == owner_id
+
 # =========================================================
 # DISCORD SETUP
 # =========================================================
@@ -1761,7 +2033,10 @@ async def on_message(message: discord.Message):
     # Owner reply actions on original messages
     if message.reference and bot_mentioned and message.author.id == data.get("owner_id"):
         try:
-            referenced = await message.channel.fetch_message(message.reference.message_id)
+            if message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
+                referenced = message.reference.resolved
+            else:
+                referenced = await message.channel.fetch_message(message.reference.message_id)
         except Exception:
             await bot.process_commands(message)
             return
@@ -1773,6 +2048,13 @@ async def on_message(message: discord.Message):
             await message.channel.send("🧹 Official record, channel records, and tracked plays have been reset.")
             if message.guild and not is_test_channel(message.channel.id):
                 await update_recap_cards(message.guild)
+            await bot.process_commands(message)
+            return
+
+        remove_id = detect_remove_play_request(content)
+        if remove_id is not None:
+            ok, msg = remove_pick_by_id(remove_id)
+            await message.channel.send(msg)
             await bot.process_commands(message)
             return
 
@@ -1885,15 +2167,30 @@ async def on_message(message: discord.Message):
             await bot.process_commands(message)
             return
 
+        if detect_show_tracked_plays_request(content):
+            await message.reply(embed=build_tracked_plays_embed(include_graded=True), mention_author=False)
+            await bot.process_commands(message)
+            return
+
+        remove_id = detect_remove_play_request(content)
+        if remove_id is not None:
+            ok, msg = remove_pick_by_id(remove_id)
+            await message.reply(msg, mention_author=False)
+            await bot.process_commands(message)
+            return
+
+    # Member win forwarding / flex forwarding
     if (
         message.guild
         and bot_mentioned
         and message.channel.id in WIN_SUBMISSION_CHANNELS
         and isinstance(message.author, discord.Member)
-        and result == "win"
         and message.author.id != data.get("owner_id")
+        and is_member_win_forward_request(content)
     ):
         await forward_member_win(message)
+        await bot.process_commands(message)
+        return
 
     if message.guild and bot_mentioned:
         channel_record_type = detect_channel_record_request(content)
@@ -2014,6 +2311,60 @@ async def pending(interaction: discord.Interaction):
         )
 
     await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(name="trackedplays", description="Owner only: view tracked plays")
+@app_commands.describe(include_graded="Also include recent graded plays")
+async def trackedplays(interaction: discord.Interaction, include_graded: Optional[bool] = False):
+    if data.get("owner_id") and not is_owner_user(interaction.user.id):
+        await interaction.response.send_message("Only the owner can view tracked plays.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(embed=build_tracked_plays_embed(include_graded=bool(include_graded)), ephemeral=True)
+
+
+@bot.tree.command(name="removeplay", description="Owner only: remove a pending tracked play by ID")
+@app_commands.describe(pick_id="The tracked play ID to remove")
+async def removeplay(interaction: discord.Interaction, pick_id: int):
+    if data.get("owner_id") and not is_owner_user(interaction.user.id):
+        await interaction.response.send_message("Only the owner can remove tracked plays.", ephemeral=True)
+        return
+
+    ok, msg = remove_pick_by_id(pick_id)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="editplay", description="Owner only: edit pending play units and/or odds")
+@app_commands.describe(
+    pick_id="The tracked play ID",
+    units="New unit size, like 2 or 2.5",
+    odds="New odds, like -110 or +145",
+)
+async def editplay(
+    interaction: discord.Interaction,
+    pick_id: int,
+    units: Optional[float] = None,
+    odds: Optional[int] = None,
+):
+    if data.get("owner_id") and not is_owner_user(interaction.user.id):
+        await interaction.response.send_message("Only the owner can edit tracked plays.", ephemeral=True)
+        return
+
+    pick = next((p for p in data.get("picks", []) if p["id"] == pick_id), None)
+    if not pick:
+        await interaction.response.send_message("That pending play was not found.", ephemeral=True)
+        return
+
+    ok, msg = update_pending_pick_values(pick, units, odds)
+    if not ok:
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"✏️ Pick #{pick['id']} updated • {msg}",
+        embed=build_pick_embed(pick),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="grade", description="Grade a pending pick")
@@ -2160,6 +2511,10 @@ async def settings_show(interaction: discord.Interaction):
 
 @settings_group.command(name="set_owner", description="Set the owner user")
 async def settings_set_owner(interaction: discord.Interaction, user: discord.User):
+    if data.get("owner_id") and not is_owner_user(interaction.user.id):
+        await interaction.response.send_message("Only the current owner can change the owner.", ephemeral=True)
+        return
+
     data["owner_id"] = user.id
     save_data(data)
     await interaction.response.send_message(f"👑 Owner set to {user.mention}")
@@ -2168,6 +2523,10 @@ async def settings_set_owner(interaction: discord.Interaction, user: discord.Use
 
 @settings_group.command(name="set_unit_value", description="Set dollar value for 1 unit")
 async def settings_set_unit_value(interaction: discord.Interaction, amount: float):
+    if data.get("owner_id") and not is_owner_user(interaction.user.id):
+        await interaction.response.send_message("Only the owner can change settings.", ephemeral=True)
+        return
+
     if amount <= 0:
         await interaction.response.send_message("Unit value must be greater than 0.")
         return
@@ -2180,6 +2539,10 @@ async def settings_set_unit_value(interaction: discord.Interaction, amount: floa
 
 @settings_group.command(name="toggle_dollars", description="Turn dollar display on or off")
 async def settings_toggle_dollars(interaction: discord.Interaction, enabled: bool):
+    if data.get("owner_id") and not is_owner_user(interaction.user.id):
+        await interaction.response.send_message("Only the owner can change settings.", ephemeral=True)
+        return
+
     data["show_dollars"] = enabled
     save_data(data)
     state = "On" if enabled else "Off"
