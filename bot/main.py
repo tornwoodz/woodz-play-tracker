@@ -200,6 +200,9 @@ STAT_ALIASES = {
     "ar": "Assists + Rebounds",
 }
 
+# Allows normal odds and longshot futures odds like +11881
+AMERICAN_ODDS_RE = r"[+-]\d{2,6}"
+
 # =========================================================
 # STORAGE
 # =========================================================
@@ -375,14 +378,34 @@ def extract_units_from_text(text: str) -> float:
     return 1.0
 
 
+def _extract_american_odds_match(text: str) -> Optional[str]:
+    if not text:
+        return None
+
+    patterns = [
+        rf"\bodds?\s*[:=]?\s*({AMERICAN_ODDS_RE})\b",
+        rf"@\s*({AMERICAN_ODDS_RE})\b",
+        rf"\bat\s*({AMERICAN_ODDS_RE})\b",
+        rf"({AMERICAN_ODDS_RE})\s*odds?\b",
+        rf"(?<![\w/])({AMERICAN_ODDS_RE})(?!\d)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    return None
+
+
 def extract_odds_from_text(text: str) -> int:
     if not text:
         return -110
 
-    match = re.search(r"(?<!\d)([+-]\d{3,4})(?!\d)", text)
+    match = _extract_american_odds_match(text)
     if match:
         try:
-            return int(match.group(1))
+            return int(match)
         except Exception:
             pass
 
@@ -408,19 +431,12 @@ def parse_units_update(text: str) -> Optional[float]:
 
 
 def parse_odds_update(text: str) -> Optional[int]:
-    lowered = normalize_text(text)
-    patterns = [
-        r"set odds?\s*([+-]\d{3,4})",
-        r"\bodds?\s*([+-]\d{3,4})",
-        r"\b([+-]\d{3,4})\b",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, lowered)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                return None
+    match = _extract_american_odds_match(text)
+    if match:
+        try:
+            return int(match)
+        except Exception:
+            return None
     return None
 
 
@@ -916,7 +932,7 @@ def clean_ocr_lines(text: str) -> list[str]:
         if re.fullmatch(r"\$?\d+(?:\.\d+)?", line):
             continue
 
-        if re.fullmatch(r"[+-]\d{3,4}", line):
+        if re.fullmatch(AMERICAN_ODDS_RE, line):
             continue
 
         if len(line) < 2:
@@ -2454,7 +2470,7 @@ async def removeplay(interaction: discord.Interaction, pick_id: int):
 @app_commands.describe(
     pick_id="The tracked play ID",
     units="New unit size, like 2 or 2.5",
-    odds="New odds, like -110 or +145",
+    odds="New odds, like -110 or +145 or +11881",
 )
 async def editplay(
     interaction: discord.Interaction,
