@@ -3,11 +3,13 @@ import re
 import io
 import json
 import random
+import asyncio
 import aiohttp
 import discord
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 from discord.ext import commands
 from discord import app_commands
 from PIL import Image, ImageDraw, ImageFont
@@ -62,6 +64,15 @@ WIN_SUBMISSION_CHANNELS = {
     WEEKLY_LOCKS_CHANNEL_ID,
     LIVE_BETS_CHANNEL_ID,
 }
+
+CLEANUP_CHANNEL_IDS = (
+    WEEKLY_LOCKS_CHANNEL_ID,
+    HAMMERS_CHANNEL_ID,
+    PARLAYS_CHANNEL_ID,
+    LIVE_BETS_CHANNEL_ID,
+)
+
+CLEANUP_TIMEZONE = os.getenv("CLEANUP_TIMEZONE", "America/New_York")
 
 VIP_ROLE_NAME = "🏆VIP"
 PUB_ROLE_NAME = "🆓PUB"
@@ -233,8 +244,10 @@ def default_data() -> dict:
 
 
 def save_data(data_obj: dict) -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+    temp_file = f"{DATA_FILE}.tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(data_obj, f, indent=2)
+    os.replace(temp_file, DATA_FILE)
 
 
 def ensure_data_shape(data_obj: dict) -> dict:
@@ -287,8 +300,11 @@ def load_data() -> dict:
     except Exception:
         data_obj = default_data()
         save_data(data_obj)
+        return data_obj
 
-    return ensure_data_shape(data_obj)
+    data_obj = ensure_data_shape(data_obj)
+    save_data(data_obj)
+    return data_obj
 
 
 data = load_data()
@@ -790,6 +806,13 @@ def find_target_user_for_owner(message: discord.Message) -> Optional[discord.Mem
 
 def has_graphic(message: discord.Message) -> bool:
     return len(message.attachments) > 0 or len(message.embeds) > 0
+
+
+def get_cleanup_tz() -> ZoneInfo:
+    try:
+        return ZoneInfo(CLEANUP_TIMEZONE)
+    except Exception:
+        return ZoneInfo("America/New_York")
 
 # =========================================================
 # IMAGE / OCR HELPERS
@@ -1574,6 +1597,95 @@ async def update_recap_cards(guild: discord.Guild) -> None:
             )
 
 # =========================================================
+# WEEKLY CLEANUP HELPERS
+# =========================================================
+
+async def clear_channel_non_pinned_messages(channel: discord.TextChannel) -> None:
+    try:
+        pinned_messages = await channel.pins()
+        pinned_ids = {m.id for m in pinned_messages}
+    except Exception as e:
+        print(f"[CLEANUP] Failed to fetch pins for #{channel.name}: {e}")
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+    newer_than_14 = []
+    older_than_14 = []
+
+    try:
+        async for msg in channel.history(limit=None, oldest_first=False):
+            if msg.id in pinned_ids:
+                continue
+
+            if msg.created_at >= cutoff:
+                newer_than_14.append(msg)
+            else:
+                older_than_14.append(msg)
+    except Exception as e:
+        print(f"[CLEANUP] Failed to read history for #{channel.name}: {e}")
+        return
+
+    if newer_than_14:
+        for i in range(0, len(newer_than_14), 100):
+            chunk = newer_than_14[i:i + 100]
+            try:
+                if len(chunk) == 1:
+                    await chunk[0].delete()
+                else:
+                    await channel.delete_messages(chunk)
+                await asyncio.sleep(1)
+            except Exception:
+                for msg in chunk:
+                    try:
+                        await msg.delete()
+                        await asyncio.sleep(0.35)
+                    except Exception:
+                        pass
+
+    for msg in older_than_14:
+        try:
+            await msg.delete()
+            await asyncio.sleep(0.35)
+        except Exception:
+            pass
+
+    print(f"[CLEANUP] Finished #{channel.name} • kept pinned • deleted non-pinned")
+
+
+def get_next_sunday_midnight(now_local: datetime) -> datetime:
+    target = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    days_until_sunday = (6 - now_local.weekday()) % 7
+
+    if days_until_sunday == 0 and now_local >= target:
+        days_until_sunday = 7
+
+    return target + timedelta(days=days_until_sunday)
+
+
+async def weekly_cleanup_loop():
+    await bot.wait_until_ready()
+
+    tz = get_cleanup_tz()
+    print(f"[CLEANUP] Weekly cleanup scheduler started in timezone: {tz}")
+
+    while not bot.is_closed():
+        now_local = datetime.now(tz)
+        next_run = get_next_sunday_midnight(now_local)
+        sleep_seconds = max((next_run - now_local).total_seconds(), 1)
+
+        print(f"[CLEANUP] Next cleanup scheduled for {next_run.isoformat()}")
+        await asyncio.sleep(sleep_seconds)
+
+        for guild in bot.guilds:
+            for channel_id in CLEANUP_CHANNEL_IDS:
+                channel = guild.get_channel(channel_id)
+                if isinstance(channel, discord.TextChannel):
+                    try:
+                        await clear_channel_non_pinned_messages(channel)
+                    except Exception as e:
+                        print(f"[CLEANUP] Error cleaning #{channel.name}: {e}")
+
+# =========================================================
 # PICK TRACKING / RECAP HELPERS
 # =========================================================
 
@@ -1951,6 +2063,10 @@ async def on_ready():
         print(f"❌ Sync error: {e}")
 
     print(f"🔥 Logged in as {bot.user} ({bot.user.id})")
+
+    if not hasattr(bot, "weekly_cleanup_started"):
+        bot.weekly_cleanup_started = True
+        bot.loop.create_task(weekly_cleanup_loop())
 
     for guild in bot.guilds:
         try:
