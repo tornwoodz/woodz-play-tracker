@@ -692,4 +692,7 @@ async def cleanup_loop():
                 except discord.HTTPException:
                     log.exception('Cleanup failed')
 
+from pro_bridge import install_bridge
+install_bridge(bot, data, CHANNEL_IDS, get_channel)
+
 bot.run(TOKEN)
