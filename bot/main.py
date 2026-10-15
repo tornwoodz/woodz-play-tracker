@@ -7,6 +7,8 @@ import re
 import json
 import asyncio
 import logging
+import hmac
+from aiohttp import web
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -692,4 +694,71 @@ async def cleanup_loop():
                 except discord.HTTPException:
                     log.exception('Cleanup failed')
 
-bot.run(TOKEN)
+# Pick Trax PRO v0.3: read-only HTTP API on the same event loop as Discord.
+# The API reads the existing in-memory data and never writes to the records file.
+def create_api():
+    api_key = os.environ.get('PICKTRAX_API_KEY', '')
+    if len(api_key) < 32:
+        raise RuntimeError('Set PICKTRAX_API_KEY in Railway to a random secret of at least 32 characters')
+
+    @web.middleware
+    async def authorize(request, handler):
+        if request.path == '/health':
+            return await handler(request)
+        if not hmac.compare_digest(request.headers.get('Authorization', ''), 'Bearer ' + api_key):
+            raise web.HTTPUnauthorized(text='Unauthorized')
+        return await handler(request)
+
+    app = web.Application(middlewares=[authorize])
+
+    async def health(request):
+        return web.json_response({'ok': True, 'bot_ready': bot.is_ready()},
+                                 headers={'Cache-Control': 'no-store'})
+
+    async def snapshot(request):
+        def safe_record(r):
+            return {k: r.get(k, 0) for k in ('wins', 'losses', 'pushes', 'units')}
+
+        def safe_pick(p):
+            allowed = ('id', 'bet', 'tier', 'tiers', 'units', 'odds',
+                       'status', 'created_at', 'graded_at', 'profit_units')
+            return {k: p[k] for k in allowed if k in p}
+
+        return web.json_response({
+            'version': '0.3',
+            'connected': bot.is_ready(),
+            'unit_value': data.get('unit_value', 100.0),
+            'show_dollars': data.get('show_dollars', False),
+            'record': safe_record(data.get('record', {})),
+            'channel_records': {
+                tier: safe_record(data.get('channel_records', {}).get(tier, {}))
+                for tier in TIERS
+            },
+            'pending': [safe_pick(p) for p in data.get('picks', [])
+                        if p.get('status') == 'pending'],
+            'approvals': [safe_pick(p) for p in data.get('picks', [])
+                          if p.get('status') == 'approval'],
+            'graded_history': [safe_pick(p) for p in data.get('graded_history', [])[-100:]],
+        }, headers={'Cache-Control': 'no-store'})
+
+    app.router.add_get('/health', health)
+    app.router.add_get('/api/v1/snapshot', snapshot)
+    return app
+
+
+async def main():
+    async with bot:
+        runner = web.AppRunner(create_api())
+        await runner.setup()
+        try:
+            port = int(os.environ.get('PORT', '8080'))
+            site = web.TCPSite(runner, '0.0.0.0', port)
+            await site.start()
+            log.info('Pick Trax PRO API listening on port %s', port)
+            await bot.start(TOKEN)
+        finally:
+            await runner.cleanup()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
