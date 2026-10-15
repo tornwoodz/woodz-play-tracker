@@ -1,9 +1,6 @@
-"""Pick Trax — Don't Sweat Picks HQ.
-Discord.py 2.x; environment: DISCORD_TOKEN, optional TRUECAPPER_WEBHOOK_ID,
+"""Pick Trax — Don't Sweat Picks HQ. Discord.py 2.x.
+Environment: DISCORD_TOKEN, TRUECAPPER_WEBHOOK_ID (numeric webhook ID),
 TRUECAPPER_INBOX_CHANNEL_ID, OWNER_ID, DATA_FILE, CLEANUP_TIMEZONE.
-
-Channel IDs are preferred, with channel-name fallback.
-For security, the TrueCapper webhook must be allowlisted by ID and an inbox channel.
 """
 import os
 import re
@@ -20,7 +17,6 @@ from discord.ext import commands
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger('picktrax')
-
 TOKEN = os.environ['DISCORD_TOKEN']
 DATA_FILE = Path(os.getenv('DATA_FILE', '/data/dsp_fresh_records.json'))
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))
@@ -28,7 +24,6 @@ WEBHOOK_ID = int(os.getenv('TRUECAPPER_WEBHOOK_ID', '0'))
 INBOX_ID = int(os.getenv('TRUECAPPER_INBOX_CHANNEL_ID', '1560067350227853363'))
 TZ = ZoneInfo(os.getenv('CLEANUP_TIMEZONE', 'America/New_York'))
 
-# Exact Discord channel IDs take priority; names are only a fallback.
 CHANNEL_IDS = {
     'diamond': 1483435130235260928,
     'emerald': 1483433966227947619,
@@ -54,6 +49,8 @@ CHANNELS = {
     'units': ('unit-management',),
 }
 TIERS = ('diamond', 'emerald', 'sapphire')
+DESTINATIONS = {'diamond': ('diamond',), 'emerald': ('emerald',),
+                'sapphire': ('sapphire',), 'emerald_sapphire': ('emerald', 'sapphire')}
 
 def blank_record():
     return {'wins': 0, 'losses': 0, 'pushes': 0, 'units': 0.0}
@@ -81,7 +78,6 @@ def load():
     except Exception:
         log.exception('Cannot read data; refusing to overwrite existing records')
         raise
-    # Migrate old records without discarding history. Old channel stats remain in JSON.
     for k, v in default_data().items():
         obj.setdefault(k, v)
     for tier in TIERS:
@@ -126,9 +122,24 @@ def units_from(text):
     m = re.search(r'(?<!\w)(\d+(?:\.\d+)?)\s*(?:u|units?)\b', text or '', re.I)
     return float(m.group(1)) if m else 1.0
 
+def american_from_decimal(value):
+    if value <= 1:
+        raise ValueError('Decimal odds must be greater than 1')
+    return round((value - 1) * 100) if value >= 2 else -round(100 / (value - 1))
+
 def odds_from(text):
-    m = re.search(r'(?:odds?\s*[:=]?\s*|@\s*)([+-]\d{2,6})\b', text or '', re.I)
-    return int(m.group(1)) if m else -110
+    """Parse labeled American or decimal odds, including TrueCapper embedded descriptions."""
+    text = text or ''
+    m = re.search(r'\b(?:odds?|price)\s*[:=]?\s*([+-]\d{2,6})\b', text, re.I)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'\b(?:odds?|decimal\s*odds?|price)\s*[:=]?\s*(\d+\.\d+)\b', text, re.I)
+    if m:
+        return american_from_decimal(float(m.group(1)))
+    m = re.search(r'@\s*([+-]\d{2,6})\b', text)
+    if m:
+        return int(m.group(1))
+    return -110
 
 def fmt_profit(value):
     if data['show_dollars']:
@@ -137,6 +148,16 @@ def fmt_profit(value):
 
 def find_pick(pid):
     return next((p for p in data['picks'] + data['graded_history'] if p['id'] == pid), None)
+
+def pick_tiers(p):
+    tiers = p.get('tiers')
+    if tiers:
+        return [t for t in TIERS if t in tiers]
+    return [p['tier']] if p.get('tier') in TIERS else []
+
+def tier_label(p):
+    tiers = pick_tiers(p)
+    return ' + '.join(t.title() for t in tiers) if tiers else str(p.get('tier', 'Unassigned')).title()
 
 def make_pick(text, tier, source, status='pending', units=None, odds=None, attachments=None):
     pid = data['next_id']
@@ -158,7 +179,7 @@ def pick_embed(p):
     colors = {'pending': discord.Color.blurple(), 'approval': discord.Color.orange(),
               'win': discord.Color.green(), 'loss': discord.Color.red(),
               'push': discord.Color.light_grey()}
-    e = discord.Embed(title=f"DSP Pick #{p['id']} | {p['tier'].title()}",
+    e = discord.Embed(title=f"DSP Pick #{p['id']} | {tier_label(p)}",
                       description=p['bet'][:4000], color=colors.get(p['status'], discord.Color.blue()))
     e.add_field(name='Units', value=f"{p['units']:g}U")
     e.add_field(name='Odds', value=f"{p['odds']:+d}")
@@ -176,12 +197,13 @@ def rebuild_records():
     for t in TIERS:
         data['channel_records'][t] = blank_record()
     for p in data['graded_history']:
-        if p.get('test') or p.get('tier') not in TIERS:
+        if p.get('test') or not pick_tiers(p):
             continue
         status = p.get('status')
         if status not in ('win', 'loss', 'push'):
             continue
-        for r in (data['record'], data['channel_records'][p['tier']]):
+        # Overall once; each published destination once.
+        for r in [data['record']] + [data['channel_records'][t] for t in pick_tiers(p)]:
             r[{'win': 'wins', 'loss': 'losses', 'push': 'pushes'}[status]] += 1
             r['units'] = round(r['units'] + float(p.get('profit_units', 0)), 4)
     save()
@@ -233,26 +255,60 @@ async def refresh_recaps(guild):
         except discord.HTTPException:
             log.exception('Could not refresh %s recap', tier)
 
-async def publish_pick(guild, p, tier):
-    dest = get_channel(guild, tier)
-    if not dest:
-        return False, f'Cannot find #{CHANNELS[tier][0]}'
-    p['tier'] = tier
-    p['status'] = 'pending'
+async def refresh_published_cards(guild, p, remove_view=False):
+    messages = p.get('published_messages') or ([{'channel_id': p['published_channel_id'], 'message_id': p['published_message_id']}]
+                                               if p.get('published_channel_id') and p.get('published_message_id') else [])
+    for entry in messages:
+        channel = guild.get_channel(int(entry['channel_id'])) if guild else None
+        if not channel:
+            continue
+        try:
+            msg = await channel.fetch_message(int(entry['message_id']))
+            await msg.edit(embed=pick_embed(p), view=None if remove_view else GradeView(p['id']))
+        except discord.HTTPException:
+            log.exception('Could not update published card for pick #%s', p['id'])
+
+async def publish_pick(guild, p, destination):
+    tiers = DESTINATIONS.get(destination)
+    if not tiers:
+        return False, 'Invalid destination.'
+    missing = [t for t in tiers if not get_channel(guild, t)]
+    if missing:
+        return False, 'Cannot find ' + ', '.join('#' + CHANNELS[t][0] for t in missing)
+    # Keep existing approval state until every requested destination has been posted.
+    sent = []
     try:
-        msg = await dest.send(embed=pick_embed(p), view=GradeView(p['id']))
+        for tier in tiers:
+            dest = get_channel(guild, tier)
+            preview = dict(p, tier=tier, tiers=list(tiers), status='pending')
+            msg = await dest.send(embed=pick_embed(preview), view=GradeView(p['id']))
+            sent.append({'channel_id': dest.id, 'message_id': msg.id})
     except discord.HTTPException as e:
+        # Avoid half-published approvals if one channel rejects a send.
+        for entry in sent:
+            try:
+                channel = guild.get_channel(entry['channel_id'])
+                if channel:
+                    await (await channel.fetch_message(entry['message_id'])).delete()
+            except discord.HTTPException:
+                log.exception('Rollback failed for pick #%s', p['id'])
         return False, f'Failed to post: {e}'
-    p['published_message_id'] = msg.id
-    p['published_channel_id'] = dest.id
+    p['tier'] = destination if len(tiers) > 1 else tiers[0]
+    p['tiers'] = list(tiers)
+    p['status'] = 'pending'
+    p['published_messages'] = sent
+    p['published_message_id'] = sent[0]['message_id']
+    p['published_channel_id'] = sent[0]['channel_id']
     save()
     await refresh_recaps(guild)
-    return True, f'Published Pick #{p["id"]} to {dest.mention}'
+    return True, f"Published Pick #{p['id']} to " + ' and '.join(get_channel(guild, t).mention for t in tiers)
 
 class TierSelect(discord.ui.Select):
     def __init__(self, pid):
         self.pid = pid
-        super().__init__(placeholder='Choose where to publish', options=[discord.SelectOption(label=t.title(), value=t) for t in TIERS], custom_id=f'dsp:tier:{pid}')
+        options = [discord.SelectOption(label='Emerald + Sapphire', value='emerald_sapphire', emoji='✅', default=False)]
+        options += [discord.SelectOption(label=t.title(), value=t) for t in TIERS]
+        super().__init__(placeholder='Choose where to publish', options=options, custom_id=f'dsp:tier:{pid}')
     async def callback(self, interaction):
         if not owner_guard(interaction):
             return await interaction.response.send_message('Owner only.', ephemeral=True)
@@ -295,6 +351,13 @@ class ApprovalView(discord.ui.View):
         save()
         await interaction.response.edit_message(content=f'❌ Rejected TrueCapper submission #{self.pid}', view=None)
 
+async def announce_win(guild, p):
+    if p.get('test'):
+        return
+    wins = get_channel(guild, 'wins')
+    if wins:
+        await wins.send(embed=discord.Embed(title='🏆 DSP Official Win', description=f"Pick #{p['id']} | {tier_label(p)}\n{p['bet']}\n**{fmt_profit(p['profit_units'])}**", color=discord.Color.green()))
+
 class GradeView(discord.ui.View):
     def __init__(self, pid):
         super().__init__(timeout=None)
@@ -305,14 +368,22 @@ class GradeView(discord.ui.View):
         if not owner_guard(interaction):
             return await interaction.response.send_message('Owner only.', ephemeral=True)
         p = find_pick(self.pid)
-        if not p or not grade_pick(p, result):
+        if not p or p['status'] != 'pending':
             return await interaction.response.send_message('Pick is already graded or missing.', ephemeral=True)
-        await interaction.response.edit_message(embed=pick_embed(p), view=None)
-        if result == 'win' and not p.get('test'):
-            wins = get_channel(interaction.guild, 'wins')
-            if wins:
-                await wins.send(embed=discord.Embed(title='🏆 DSP Official Win', description=f"Pick #{p['id']} | {p['tier'].title()}\n{p['bet']}\n**{fmt_profit(p['profit_units'])}**", color=discord.Color.green()))
+        await interaction.response.defer(ephemeral=True)
+        if not grade_pick(p, result):
+            return await interaction.followup.send('Pick is already graded or missing.', ephemeral=True)
+        await refresh_published_cards(interaction.guild, p, remove_view=True)
+        # Owner-posted image picks and test cards may not have published_messages.
+        if not p.get('published_messages'):
+            try:
+                await interaction.message.edit(embed=pick_embed(p), view=None)
+            except discord.HTTPException:
+                log.exception('Could not edit graded card')
+        if result == 'win':
+            await announce_win(interaction.guild, p)
         await refresh_recaps(interaction.guild)
+        await interaction.followup.send(f'Pick #{p["id"]} graded {result.upper()}.', ephemeral=True)
     @discord.ui.button(label='Win', style=discord.ButtonStyle.success, custom_id='dsp:win')
     async def win(self, interaction, button):
         await self.perform(interaction, 'win')
@@ -338,7 +409,7 @@ async def on_ready():
             await bot.tree.sync()
         except Exception:
             log.exception('Slash sync failed')
-        bot.loop.create_task(cleanup_loop())
+        asyncio.create_task(cleanup_loop())
     for guild in bot.guilds:
         await refresh_recaps(guild)
 
@@ -346,7 +417,6 @@ async def on_ready():
 async def on_message(message):
     if not message.guild:
         return
-    # Never trust a webhook merely because its display name is TrueCapper.
     if message.webhook_id:
         if not WEBHOOK_ID or not INBOX_ID or message.webhook_id != WEBHOOK_ID or message.channel.id != INBOX_ID:
             return
@@ -356,7 +426,11 @@ async def on_message(message):
         if not control:
             log.error('No #pick-trax-approvals channel for TrueCapper approvals')
             return
-        text = message.content or '\n'.join(e.description or e.title or '' for e in message.embeds)
+        parts = [message.content or '']
+        for e in message.embeds:
+            parts.extend([e.title or '', e.description or ''])
+            parts.extend(f'{f.name}: {f.value}' for f in e.fields)
+        text = '\n'.join(s for s in parts if s)
         image_urls = [a.url for a in message.attachments if a.content_type and a.content_type.startswith('image/')]
         for e in message.embeds:
             if e.image and e.image.url:
@@ -390,7 +464,7 @@ async def record(interaction: discord.Interaction):
 @bot.tree.command(name='pending', description='Show active DSP picks')
 async def pending(interaction: discord.Interaction):
     ps = [p for p in data['picks'] if p['status'] == 'pending']
-    lines = [f"#{p['id']} {p['tier']} | {p['units']:g}U @ {p['odds']:+d}" for p in ps[:35]]
+    lines = [f"#{p['id']} {tier_label(p)} | {p['units']:g}U @ {p['odds']:+d}" for p in ps[:35]]
     await interaction.response.send_message('\n'.join(lines) or 'No pending picks.', ephemeral=True)
 
 @bot.tree.command(name='editplay', description='Owner: edit units or odds for a pending pick')
@@ -405,11 +479,13 @@ async def editplay(interaction: discord.Interaction, pick_id: int, units: float 
             return await interaction.response.send_message('Units must be positive.', ephemeral=True)
         p['units'] = round(units, 4)
     if odds is not None:
-        if odds == 0:
-            return await interaction.response.send_message('Odds cannot be zero.', ephemeral=True)
+        if odds == 0 or -99 <= odds <= 99:
+            return await interaction.response.send_message('Enter valid American odds (e.g. +134 or -110).', ephemeral=True)
         p['odds'] = odds
     save()
     await interaction.response.send_message(f"Updated #{pick_id}: {p['units']:g}U @ {p['odds']:+d}", ephemeral=True)
+    if p['status'] == 'pending':
+        await refresh_published_cards(interaction.guild, p)
 
 @bot.tree.command(name='grade', description='Owner: grade a pick by its ID')
 @app_commands.choices(result=[app_commands.Choice(name=x.title(), value=x) for x in ('win','loss','push')])
@@ -420,10 +496,9 @@ async def grade(interaction: discord.Interaction, pick_id: int, result: app_comm
     if not p or not grade_pick(p, result.value):
         return await interaction.response.send_message('Pending pick not found.', ephemeral=True)
     await interaction.response.send_message(f"Pick #{pick_id}: {result.value.upper()} | {fmt_profit(p['profit_units'])}")
-    if result.value == 'win' and not p.get('test'):
-        wins = get_channel(interaction.guild, 'wins')
-        if wins:
-            await wins.send(embed=discord.Embed(title='🏆 DSP Official Win', description=f"Pick #{p['id']} | {p['tier'].title()}\n{p['bet']}\n**{fmt_profit(p['profit_units'])}**", color=discord.Color.green()))
+    await refresh_published_cards(interaction.guild, p, remove_view=True)
+    if result.value == 'win':
+        await announce_win(interaction.guild, p)
     await refresh_recaps(interaction.guild)
 
 @bot.tree.command(name='removeplay', description='Owner: remove an ungraded pick')
@@ -487,7 +562,6 @@ async def cleanup_loop():
         days = (6 - local.weekday()) % 7 or 7
         next_run = (local + timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
         await asyncio.sleep(max(1, (next_run - local).total_seconds()))
-        # Safety: only remove old bot tracking cards, not users' posts or locked picks.
         for guild in bot.guilds:
             test = get_channel(guild, 'test')
             if test:
